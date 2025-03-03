@@ -1,0 +1,5 @@
+# Ignore all MP3 files
+*.mp3
+
+# Ignore all W4A files
+*.w4a
