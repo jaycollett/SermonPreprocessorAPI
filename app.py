@@ -117,19 +117,19 @@ def download_sermon_audio(sermon_id):
 
 def background_worker():
     """
-    Background worker that scrapes sermons every 5 minutes.
+    Background worker that scrapes sermons every 20 minutes.
     It calls the process_sermons() function from background_scraper.py.
     """
-    logger.info("🟢 Sermon scraper worker started. Checking for new sermons every 5 minutes.")
+    logger.info("🟢 Sermon scraper worker started. Checking for new sermons every 20 minutes.")
     while True:
-        logger.info("⏳ Worker sleeping for 5 minutes...")
-        time.sleep(300)  # 300 seconds = 5 minutes
+        logger.info("⏳ Worker sleeping for 20 minutes...")
+        time.sleep(1200)  # 1200 seconds = 20 minutes
         logger.info("🔍 Worker waking up to check for new sermons...")
         try:
-            # Import process_sermons from background_scraper.py.
-            # Ensure that background_scraper.py is structured as a module (i.e. no auto-run on import).
-            from background_scraper import process_sermons
-            process_sermons()
+            from background_scraper import process_sermons, get_database_connection
+            conn, cursor = get_database_connection()
+            process_sermons(cursor, conn)
+            conn.close()
             logger.info("✅ Sermon scraping cycle completed successfully.")
         except Exception as e:
             logger.error("❌ Worker error during sermon scraping: %s", e)

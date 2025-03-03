@@ -6,8 +6,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code (including app.py and background_scraper.py)
-COPY . .
+# Copy the required files
+COPY app.py .
+COPY background_scraper.py .
 
 # Set environment variables (including the API key for basic authentication) API KEY IS NOT REAL
 ENV API_KEY=499817f8-623f-4fae-b828-8dc551aba9bb
