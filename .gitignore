@@ -3,3 +3,4 @@
 
 # Ignore all W4A files
 *.w4a
+/data

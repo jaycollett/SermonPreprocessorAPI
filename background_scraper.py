@@ -95,36 +95,56 @@ def process_sermons(cursor, conn):
     """
     Scrape sermons from page 1 and process each one.
     It checks for duplicates in the database before downloading and inserting new sermons.
+    Enhanced error control and logging have been added to capture issues, including SQLite unique constraint violations.
     """
     page_num = 1
-    sermons = scrape_page(page_num)
-    
+    try:
+        sermons = scrape_page(page_num)
+    except Exception as e:
+        logging.error("❌ Error scraping page %s: %s", page_num, e)
+        return
+
     if not sermons:
         logging.info("✅ No sermons found on page 1.")
         return
-    
+
     for title, audio_url, categories in sermons:
-        # Check if the sermon is already in the database by audio URL
-        cursor.execute("SELECT COUNT(*) FROM sermons WHERE audio_url = ?", (audio_url,))
-        exists = cursor.fetchone()[0]
-        if exists:
-            logging.info(f"🔄 Skipping duplicate: {title}")
-            continue
+        try:
+            # Log details of the sermon before processing
+            logging.debug("Processing sermon: Title: %s | Audio URL: %s | Categories: %s", title, audio_url, categories)
+            
+            # Check if the sermon is already in the database by audio URL
+            cursor.execute("SELECT COUNT(*) FROM sermons WHERE audio_url = ?", (audio_url,))
+            exists = cursor.fetchone()[0]
+            if exists:
+                logging.info("🔄 Skipping duplicate: %s with audio_url: %s", title, audio_url)
+                continue
 
-        file_path = download_audio(audio_url)
-        if not file_path:
-            continue
+            file_path = download_audio(audio_url)
+            if not file_path:
+                logging.error("⚠️ Download failed for sermon '%s' with audio_url: %s", title, audio_url)
+                continue
 
-        fetched_date = time.strftime('%Y-%m-%d %H:%M:%S')
-        sermon_id = str(uuid.uuid4())  # Generate a UUID for the sermon
-        
-        cursor.execute('''
-            INSERT INTO sermons (id, title, audio_url, file_path, categories, fetched_date)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (sermon_id, title, audio_url, file_path, categories, fetched_date))
-        conn.commit()
+            fetched_date = time.strftime('%Y-%m-%d %H:%M:%S')
+            sermon_id = str(uuid.uuid4())  # Generate a UUID for the sermon
+            
+            try:
+                cursor.execute('''
+                    INSERT INTO sermons (id, title, audio_url, file_path, categories, fetched_date)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (sermon_id, title, audio_url, file_path, categories, fetched_date))
+                conn.commit()
+                logging.info("✅ Inserted sermon: %s (ID: %s)", title, sermon_id)
+            except sqlite3.IntegrityError as e:
+                # Likely a unique constraint error, e.g. on file_path or audio_url
+                logging.error("❌ SQLite IntegrityError for sermon '%s'. Audio URL: %s, File Path: %s. Error: %s", title, audio_url, file_path, e)
+                conn.rollback()
+            except Exception as e:
+                logging.error("❌ Unexpected error during insertion of sermon '%s'. Audio URL: %s, File Path: %s. Error: %s", title, audio_url, file_path, e)
+                conn.rollback()
+        except Exception as e:
+            logging.error("❌ Error processing sermon '%s' with audio_url: %s. Error: %s", title, audio_url, e)
 
-        logging.info(f"✅ Inserted: {title} (ID: {sermon_id})")
 
 if __name__ == "__main__":
     conn, cursor = get_database_connection()
