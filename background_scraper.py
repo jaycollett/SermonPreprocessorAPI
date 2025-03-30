@@ -94,8 +94,11 @@ def scrape_page(page_num):
 def process_sermons(cursor, conn):
     """
     Scrape sermons from page 1 and process each one.
-    It checks for duplicates in the database before downloading and inserting new sermons.
-    Enhanced error control and logging have been added to capture issues, including SQLite unique constraint violations.
+    It checks for duplicates (using a normalized file path derived from the audio URL)
+    before downloading and inserting new sermons.
+    If a duplicate is found (i.e. a corresponding DB record exists), it logs as info.
+    If the audio file exists on disk but no DB record is present, it is overwritten.
+    Enhanced error control and logging are in place for troubleshooting.
     """
     page_num = 1
     try:
@@ -110,20 +113,41 @@ def process_sermons(cursor, conn):
 
     for title, audio_url, categories in sermons:
         try:
+            # Normalize the file name from the audio URL (ignoring query parameters)
+            parsed = urlparse(audio_url)
+            file_name = os.path.basename(parsed.path)
+            normalized_file_path = os.path.join(AUDIO_DIR, file_name)
+
+            # Check for duplicate by normalized file_path in the database
+            cursor.execute("SELECT COUNT(*) FROM sermons WHERE file_path = ?", (normalized_file_path,))
+            exists = cursor.fetchone()[0]
+            if exists:
+                logging.info("🔄 Duplicate already stored: %s (File: %s)", title, normalized_file_path)
+                continue
+
+            # If the audio file exists on disk but there's no DB record, overwrite it.
+            if os.path.exists(normalized_file_path):
+                logging.info("Audio file %s exists on disk without a DB record. Removing to force re-download.", normalized_file_path)
+                try:
+                    os.remove(normalized_file_path)
+                except Exception as e:
+                    logging.error("Failed to remove existing file %s: %s", normalized_file_path, e)
+                    continue
+
             # Log details of the sermon before processing
             logging.debug("Processing sermon: Title: %s | Audio URL: %s | Categories: %s", title, audio_url, categories)
             
-            # Check if the sermon is already in the database by audio URL
-            cursor.execute("SELECT COUNT(*) FROM sermons WHERE audio_url = ?", (audio_url,))
-            exists = cursor.fetchone()[0]
-            if exists:
-                logging.info("🔄 Skipping duplicate: %s with audio_url: %s", title, audio_url)
+            # Download the audio file (will download since the file was removed if it existed)
+            downloaded_file_path = download_audio(audio_url)
+            if not downloaded_file_path:
+                logging.error("⚠️ Download failed for sermon '%s' with Audio URL: %s", title, audio_url)
                 continue
 
-            file_path = download_audio(audio_url)
-            if not file_path:
-                logging.error("⚠️ Download failed for sermon '%s' with audio_url: %s", title, audio_url)
-                continue
+            # If the downloaded file path differs from the normalized one, log a warning and use the downloaded value.
+            if downloaded_file_path != normalized_file_path:
+                logging.warning("Normalized file path (%s) differs from downloaded file path (%s) for sermon '%s'",
+                                normalized_file_path, downloaded_file_path, title)
+                normalized_file_path = downloaded_file_path
 
             fetched_date = time.strftime('%Y-%m-%d %H:%M:%S')
             sermon_id = str(uuid.uuid4())  # Generate a UUID for the sermon
@@ -132,19 +156,24 @@ def process_sermons(cursor, conn):
                 cursor.execute('''
                     INSERT INTO sermons (id, title, audio_url, file_path, categories, fetched_date)
                     VALUES (?, ?, ?, ?, ?, ?)
-                ''', (sermon_id, title, audio_url, file_path, categories, fetched_date))
+                ''', (sermon_id, title, audio_url, normalized_file_path, categories, fetched_date))
                 conn.commit()
                 logging.info("✅ Inserted sermon: %s (ID: %s)", title, sermon_id)
             except sqlite3.IntegrityError as e:
-                # Likely a unique constraint error, e.g. on file_path or audio_url
-                logging.error("❌ SQLite IntegrityError for sermon '%s'. Audio URL: %s, File Path: %s. Error: %s", title, audio_url, file_path, e)
-                conn.rollback()
+                # If the IntegrityError is due to a duplicate, log as info
+                if "UNIQUE constraint failed" in str(e):
+                    logging.info("🔄 Sermon already exists (detected at insert): %s (File: %s)", title, normalized_file_path)
+                    conn.rollback()
+                else:
+                    logging.error("❌ SQLite IntegrityError for sermon '%s'. Audio URL: %s, File: %s. Error: %s",
+                                  title, audio_url, normalized_file_path, e)
+                    conn.rollback()
             except Exception as e:
-                logging.error("❌ Unexpected error during insertion of sermon '%s'. Audio URL: %s, File Path: %s. Error: %s", title, audio_url, file_path, e)
+                logging.error("❌ Unexpected error during insertion of sermon '%s'. Audio URL: %s, File: %s. Error: %s",
+                              title, audio_url, normalized_file_path, e)
                 conn.rollback()
         except Exception as e:
-            logging.error("❌ Error processing sermon '%s' with audio_url: %s. Error: %s", title, audio_url, e)
-
+            logging.error("❌ Error processing sermon '%s' with Audio URL: %s. Error: %s", title, audio_url, e)
 
 if __name__ == "__main__":
     conn, cursor = get_database_connection()
