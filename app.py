@@ -117,10 +117,10 @@ def download_sermon_audio(sermon_id):
 
 def background_worker():
     """
-    Background worker that scrapes sermons every 20 minutes.
+    Background worker that checks the podcast feed for new sermons every 20 minutes.
     It calls the process_sermons() function from background_scraper.py.
     """
-    logger.info("🟢 Sermon scraper worker started. Checking for new sermons every 20 minutes.")
+    logger.info("🟢 Podcast feed worker started. Checking for new sermons every 20 minutes.")
     while True:
         logger.info("⏳ Worker sleeping for 20 minutes...")
         time.sleep(1200)  # 1200 seconds = 20 minutes
@@ -130,9 +130,9 @@ def background_worker():
             conn, cursor = get_database_connection()
             process_sermons(cursor, conn)
             conn.close()
-            logger.info("✅ Sermon scraping cycle completed successfully.")
+            logger.info("✅ Podcast feed processing cycle completed successfully.")
         except Exception as e:
-            logger.error("❌ Worker error during sermon scraping: %s", e)
+            logger.error("❌ Worker error during podcast feed processing: %s", e)
 
 
 if __name__ == "__main__":

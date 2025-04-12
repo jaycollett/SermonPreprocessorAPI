@@ -4,7 +4,7 @@ import sqlite3
 import logging
 import time
 import uuid
-from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 # Configure logging
@@ -14,7 +14,7 @@ logging.basicConfig(
 )
 
 # Constants and configuration
-BASE_URL = "https://tcfky.com/sermons/page/"
+PODCAST_FEED_URL = "https://tcfky.com/feed/podcast"
 DB_PATH = os.getenv("DB_PATH", "/data/SermonProcessor.db")
 AUDIO_DIR = os.getenv("AUDIO_DIR", "/data/audiofiles")
 HEADERS = {
@@ -55,60 +55,69 @@ def download_audio(audio_url):
         logging.error(f"⚠️ Error downloading {audio_url}: {e}")
         return None
 
-def scrape_page(page_num):
-    """Scrape sermons from a given page."""
-    url = f"{BASE_URL}{page_num}/"
-    logging.info(f"📡 Fetching page {page_num}: {url}")
-
+def fetch_podcast_feed():
+    """
+    Fetch and parse the podcast XML feed.
+    Returns a list of sermon data tuples (title, audio_url, categories).
+    """
+    logging.info(f"📡 Fetching podcast feed: {PODCAST_FEED_URL}")
+    
     try:
-        response = requests.get(url, headers=HEADERS)
+        response = requests.get(PODCAST_FEED_URL, headers=HEADERS)
     except Exception as e:
-        logging.error(f"⚠️ Request error for page {page_num}: {e}")
+        logging.error(f"⚠️ Request error for podcast feed: {e}")
         return []
     
     if response.status_code != 200:
-        logging.error(f"❌ Page {page_num} returned status {response.status_code}.")
+        logging.error(f"❌ Podcast feed returned status {response.status_code}.")
         return []
-    
-    soup = BeautifulSoup(response.text, "html.parser")
-    sermons = []
-    
-    # Loop through sermon blocks
-    for sermon in soup.find_all("div", class_="fusion-post-timeline"):
-        title_tag = sermon.find("h2", class_="entry-title")
-        title = title_tag.get_text(strip=True) if title_tag else "Unknown Sermon"
+
+    try:
+        # Parse XML feed
+        root = ET.fromstring(response.content)
         
-        # Extract categories
-        category_links = sermon.find_all("a", rel="category tag")
-        categories = ", ".join([cat.get_text(strip=True) for cat in category_links]) if category_links else "Uncategorized"
-
-        # Extract audio file URL
-        audio_tag = sermon.find("audio", class_="wp-audio-shortcode")
-        audio_url = audio_tag.find("source")["src"] if audio_tag and audio_tag.find("source") else None
-
-        if audio_url:
-            sermons.append((title, audio_url, categories))
+        # Find all item elements (each represents a sermon)
+        namespace = {'itunes': 'http://www.itunes.com/dtds/podcast-1.0.dtd'}
+        items = root.findall('.//item')
+        
+        sermons = []
+        for item in items:
+            # Extract sermon title
+            title_elem = item.find('./title')
+            title = title_elem.text if title_elem is not None else "Unknown Sermon"
+            
+            # Extract audio URL (enclosure element with type="audio/mpeg")
+            enclosure = item.find('./enclosure[@type="audio/mpeg"]')
+            audio_url = enclosure.get('url') if enclosure is not None else None
+            
+            # Extract categories
+            category_elems = item.findall('./category')
+            categories = ", ".join([cat.text for cat in category_elems if cat.text]) if category_elems else "Uncategorized"
+            
+            # If we have an audio URL, add this sermon to our list
+            if audio_url:
+                sermons.append((title, audio_url, categories))
+        
+        logging.info(f"✅ Successfully parsed podcast feed. Found {len(sermons)} sermons.")
+        return sermons
     
-    return sermons
+    except Exception as e:
+        logging.error(f"❌ Error parsing podcast XML: {e}")
+        return []
 
 def process_sermons(cursor, conn):
     """
-    Scrape sermons from page 1 and process each one.
-    It checks for duplicates (using a normalized file path derived from the audio URL)
-    before downloading and inserting new sermons.
-    If a duplicate is found (i.e. a corresponding DB record exists), it logs as info.
-    If the audio file exists on disk but no DB record is present, it is overwritten.
-    Enhanced error control and logging are in place for troubleshooting.
+    Fetch sermons from the podcast feed and process each one.
+    Checks for duplicates before downloading and inserting new sermons.
     """
-    page_num = 1
     try:
-        sermons = scrape_page(page_num)
+        sermons = fetch_podcast_feed()
     except Exception as e:
-        logging.error("❌ Error scraping page %s: %s", page_num, e)
+        logging.error(f"❌ Error fetching podcast feed: {e}")
         return
 
     if not sermons:
-        logging.info("✅ No sermons found on page 1.")
+        logging.info("✅ No sermons found in podcast feed.")
         return
 
     for title, audio_url, categories in sermons:
@@ -118,35 +127,52 @@ def process_sermons(cursor, conn):
             file_name = os.path.basename(parsed.path)
             normalized_file_path = os.path.join(AUDIO_DIR, file_name)
 
-            # Check for duplicate by normalized file_path in the database
+            # Check for duplicates using multiple identifiers to avoid re-downloading
+            # sermons that were downloaded with the old web scraping code
+
+            # Check by audio_url (direct match with podcast URL)
+            cursor.execute("SELECT COUNT(*) FROM sermons WHERE audio_url = ?", (audio_url,))
+            exists_by_url = cursor.fetchone()[0]
+            
+            # Check by file_path
             cursor.execute("SELECT COUNT(*) FROM sermons WHERE file_path = ?", (normalized_file_path,))
-            exists = cursor.fetchone()[0]
-            if exists:
-                logging.info("🔄 Duplicate already stored: %s (File: %s)", title, normalized_file_path)
+            exists_by_path = cursor.fetchone()[0]
+            
+            # Check by title (for cases where URLs changed but content is the same)
+            cursor.execute("SELECT COUNT(*) FROM sermons WHERE title = ?", (title,))
+            exists_by_title = cursor.fetchone()[0]
+            
+            if exists_by_url or exists_by_path or exists_by_title:
+                logging.info(f"🔄 Duplicate sermon detected: {title}")
+                if exists_by_url:
+                    logging.debug(f"  - Matched by audio URL")
+                if exists_by_path:
+                    logging.debug(f"  - Matched by file path: {normalized_file_path}")
+                if exists_by_title:
+                    logging.debug(f"  - Matched by title")
                 continue
 
             # If the audio file exists on disk but there's no DB record, overwrite it.
             if os.path.exists(normalized_file_path):
-                logging.info("Audio file %s exists on disk without a DB record. Removing to force re-download.", normalized_file_path)
+                logging.info(f"Audio file {normalized_file_path} exists on disk without a DB record. Removing to force re-download.")
                 try:
                     os.remove(normalized_file_path)
                 except Exception as e:
-                    logging.error("Failed to remove existing file %s: %s", normalized_file_path, e)
+                    logging.error(f"Failed to remove existing file {normalized_file_path}: {e}")
                     continue
 
             # Log details of the sermon before processing
-            logging.debug("Processing sermon: Title: %s | Audio URL: %s | Categories: %s", title, audio_url, categories)
+            logging.debug(f"Processing sermon: Title: {title} | Audio URL: {audio_url} | Categories: {categories}")
             
-            # Download the audio file (will download since the file was removed if it existed)
+            # Download the audio file
             downloaded_file_path = download_audio(audio_url)
             if not downloaded_file_path:
-                logging.error("⚠️ Download failed for sermon '%s' with Audio URL: %s", title, audio_url)
+                logging.error(f"⚠️ Download failed for sermon '{title}' with Audio URL: {audio_url}")
                 continue
 
             # If the downloaded file path differs from the normalized one, log a warning and use the downloaded value.
             if downloaded_file_path != normalized_file_path:
-                logging.warning("Normalized file path (%s) differs from downloaded file path (%s) for sermon '%s'",
-                                normalized_file_path, downloaded_file_path, title)
+                logging.warning(f"Normalized file path ({normalized_file_path}) differs from downloaded file path ({downloaded_file_path}) for sermon '{title}'")
                 normalized_file_path = downloaded_file_path
 
             fetched_date = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -158,31 +184,29 @@ def process_sermons(cursor, conn):
                     VALUES (?, ?, ?, ?, ?, ?)
                 ''', (sermon_id, title, audio_url, normalized_file_path, categories, fetched_date))
                 conn.commit()
-                logging.info("✅ Inserted sermon: %s (ID: %s)", title, sermon_id)
+                logging.info(f"✅ Inserted sermon: {title} (ID: {sermon_id})")
             except sqlite3.IntegrityError as e:
                 # If the IntegrityError is due to a duplicate, log as info
                 if "UNIQUE constraint failed" in str(e):
-                    logging.info("🔄 Sermon already exists (detected at insert): %s (File: %s)", title, normalized_file_path)
+                    logging.info(f"🔄 Sermon already exists (detected at insert): {title} (File: {normalized_file_path})")
                     conn.rollback()
                 else:
-                    logging.error("❌ SQLite IntegrityError for sermon '%s'. Audio URL: %s, File: %s. Error: %s",
-                                  title, audio_url, normalized_file_path, e)
+                    logging.error(f"❌ SQLite IntegrityError for sermon '{title}'. Audio URL: {audio_url}, File: {normalized_file_path}. Error: {e}")
                     conn.rollback()
             except Exception as e:
-                logging.error("❌ Unexpected error during insertion of sermon '%s'. Audio URL: %s, File: %s. Error: %s",
-                              title, audio_url, normalized_file_path, e)
+                logging.error(f"❌ Unexpected error during insertion of sermon '{title}'. Audio URL: {audio_url}, File: {normalized_file_path}. Error: {e}")
                 conn.rollback()
         except Exception as e:
-            logging.error("❌ Error processing sermon '%s' with Audio URL: %s. Error: %s", title, audio_url, e)
+            logging.error(f"❌ Error processing sermon '{title}' with Audio URL: {audio_url}. Error: {e}")
 
 if __name__ == "__main__":
     conn, cursor = get_database_connection()
     logging.info("✅ Database connection established. Starting single scraping cycle.")
 
     try:
-        logging.info("🔍 Starting scraping cycle...")
+        logging.info("🔍 Starting podcast feed processing cycle...")
         process_sermons(cursor, conn)
-        logging.info("✅ Scraping cycle complete.")
+        logging.info("✅ Processing cycle complete.")
     except Exception as e:
         logging.error(f"⚠️ Unexpected error: {e}")
     finally:

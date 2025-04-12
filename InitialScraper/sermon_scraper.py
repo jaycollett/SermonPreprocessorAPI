@@ -4,7 +4,7 @@ import sqlite3
 import logging
 import time
 import uuid
-from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 # Configure logging
@@ -14,7 +14,7 @@ logging.basicConfig(
 )
 
 # Constants
-BASE_URL = "https://tcfky.com/sermons/page/"
+PODCAST_FEED_URL = "https://tcfky.com/feed/podcast"
 DB_PATH = os.getenv("DB_PATH", "/data/SermonProcessor.db")
 AUDIO_DIR = os.getenv("AUDIO_DIR", "/data/audiofiles")
 HEADERS = {
@@ -69,73 +69,119 @@ def download_audio(audio_url):
             logging.info(f"✅ Downloaded: {file_name}")
             return file_path
         else:
-            logging.error(f"❌ Failed to download {audio_url}")
+            logging.error(f"❌ Failed to download {audio_url} (status: {response.status_code})")
             return None
     except Exception as e:
         logging.error(f"⚠️ Error downloading {audio_url}: {e}")
         return None
 
-def scrape_page(page_num):
-    """Scrape sermons from a given page."""
-    url = f"{BASE_URL}{page_num}/"
-    logging.info(f"📡 Fetching page {page_num}: {url}")
-
-    response = requests.get(url, headers=HEADERS)
-    if response.status_code != 200:
-        logging.error(f"❌ Page {page_num} returned status {response.status_code}. Stopping.")
+def fetch_podcast_feed():
+    """Fetch and parse the podcast XML feed."""
+    logging.info(f"📡 Fetching podcast feed: {PODCAST_FEED_URL}")
+    
+    try:
+        response = requests.get(PODCAST_FEED_URL, headers=HEADERS)
+    except Exception as e:
+        logging.error(f"⚠️ Request error for podcast feed: {e}")
         return []
     
-    soup = BeautifulSoup(response.text, "html.parser")
-    sermons = []
-    
-    for sermon in soup.find_all("div", class_="fusion-post-timeline"):
-        title_tag = sermon.find("h2", class_="entry-title")
-        title = title_tag.get_text(strip=True) if title_tag else "Unknown Sermon"
+    if response.status_code != 200:
+        logging.error(f"❌ Podcast feed returned status {response.status_code}.")
+        return []
+
+    try:
+        # Parse XML feed
+        root = ET.fromstring(response.content)
         
-        # Extract categories
-        category_links = sermon.find_all("a", rel="category tag")
-        categories = ", ".join([cat.get_text(strip=True) for cat in category_links]) if category_links else "Uncategorized"
-
-        # Extract audio file URL
-        audio_tag = sermon.find("audio", class_="wp-audio-shortcode")
-        audio_url = audio_tag.find("source")["src"] if audio_tag and audio_tag.find("source") else None
-
-        if audio_url:
-            sermons.append((title, audio_url, categories))
+        # Find all item elements (each represents a sermon)
+        items = root.findall('.//item')
+        
+        sermons = []
+        for item in items:
+            # Extract sermon title
+            title_elem = item.find('./title')
+            title = title_elem.text if title_elem is not None else "Unknown Sermon"
+            
+            # Extract audio URL (enclosure element with type="audio/mpeg")
+            enclosure = item.find('./enclosure[@type="audio/mpeg"]')
+            audio_url = enclosure.get('url') if enclosure is not None else None
+            
+            # Extract categories
+            category_elems = item.findall('./category')
+            categories = ", ".join([cat.text for cat in category_elems if cat.text]) if category_elems else "Uncategorized"
+            
+            # If we have an audio URL, add this sermon to our list
+            if audio_url:
+                sermons.append((title, audio_url, categories))
+        
+        logging.info(f"✅ Successfully parsed podcast feed. Found {len(sermons)} sermons.")
+        return sermons
     
-    return sermons
+    except Exception as e:
+        logging.error(f"❌ Error parsing podcast XML: {e}")
+        return []
 
 def process_sermons():
-    """Scrape and store sermons from pages 1-37."""
-    for page_num in range(1, 38):  # Pages 1 to 37
-        sermons = scrape_page(page_num)
-        if not sermons:
-            logging.info(f"✅ No more sermons found on page {page_num}. Stopping.")
-            break
-        
-        for title, audio_url, categories in sermons:
-            file_path = download_audio(audio_url)
-            if not file_path:
-                continue
-
-            fetched_date = time.strftime('%Y-%m-%d %H:%M:%S')
-
+    """Process all sermons from the podcast feed."""
+    sermons = fetch_podcast_feed()
+    if not sermons:
+        logging.info("✅ No sermons found in podcast feed.")
+        return
+    
+    logging.info(f"🔍 Found {len(sermons)} sermons in the podcast feed")
+    
+    for title, audio_url, categories in sermons:
+        try:
+            # Normalize the file name from the audio URL
+            file_name = os.path.basename(urlparse(audio_url).path)
+            file_path = os.path.join(AUDIO_DIR, file_name)
+            
+            # Check for duplicates using multiple identifiers to avoid re-downloading
+            # sermons that were downloaded with the old web scraping code
+            
+            # Check by audio_url (direct match with podcast URL)
             cursor.execute("SELECT COUNT(*) FROM sermons WHERE audio_url = ?", (audio_url,))
-            exists = cursor.fetchone()[0]
-            if exists:
-                logging.info(f"🔄 Skipping duplicate: {title}")
+            exists_by_url = cursor.fetchone()[0]
+            
+            # Check by file_path
+            cursor.execute("SELECT COUNT(*) FROM sermons WHERE file_path = ?", (file_path,))
+            exists_by_path = cursor.fetchone()[0]
+            
+            # Check by title (for cases where URLs changed but content is the same)
+            cursor.execute("SELECT COUNT(*) FROM sermons WHERE title = ?", (title,))
+            exists_by_title = cursor.fetchone()[0]
+            
+            if exists_by_url or exists_by_path or exists_by_title:
+                logging.info(f"🔄 Duplicate sermon detected: {title}")
+                if exists_by_url:
+                    logging.debug(f"  - Matched by audio URL")
+                if exists_by_path:
+                    logging.debug(f"  - Matched by file path: {file_path}")
+                if exists_by_title:
+                    logging.debug(f"  - Matched by title")
                 continue
             
-            sermon_id = str(uuid.uuid4())  # Generate UUID v4 for the sermon
+            # Download the audio file
+            downloaded_file_path = download_audio(audio_url)
+            if not downloaded_file_path:
+                logging.error(f"⚠️ Download failed for sermon '{title}' with URL: {audio_url}")
+                continue
+            
+            fetched_date = time.strftime('%Y-%m-%d %H:%M:%S')
+            sermon_id = str(uuid.uuid4())  # Generate UUID for sermon ID
+            
+            # Insert into database
             cursor.execute('''
                 INSERT INTO sermons (id, title, audio_url, file_path, categories, fetched_date)
                 VALUES (?, ?, ?, ?, ?, ?)
-            ''', (sermon_id, title, audio_url, file_path, categories, fetched_date))
+            ''', (sermon_id, title, audio_url, downloaded_file_path, categories, fetched_date))
             conn.commit()
-
+            
             logging.info(f"✅ Inserted: {title} (ID: {sermon_id})")
+        except Exception as e:
+            logging.error(f"❌ Error processing sermon '{title}': {e}")
+            continue
 
 process_sermons()
 conn.close()
-logging.info("\n🎉 HTML Scraping & Download Complete! Check SermonProcessor.db and audiofiles directory.")
- 
+logging.info("\n🎉 Podcast Feed Processing & Download Complete! Check SermonProcessor.db and audiofiles directory.")
