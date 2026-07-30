@@ -2,6 +2,12 @@ name: Publish Docker
 on:
   release:
     types: [published]
+  # Weekly rebuild. Image staleness, not app code, is what produces most
+  # fixable Critical/High CVEs, so the newest release tag is rebuilt on a
+  # fresh base and repushed. Staggered across repos to spread the load.
+  schedule:
+    - cron: '40 4 * * 4'
+  workflow_dispatch:
 jobs:
   push_to_registry:
     name: Push Docker image to GitHub Packages
@@ -20,6 +26,10 @@ jobs:
 
       - name: Check out the repo
         uses: actions/checkout@v4.2.2
+        with:
+          # Tags are needed so the scheduled rebuild can find the newest
+          # release to rebuild.
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3.8.0
@@ -32,7 +42,25 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set lowercase repository and tag name
+        id: names
         run: |
+          set -eu
+          if [ -z "${TAG_NAME}" ]; then
+            # Scheduled / manual rebuild: there is no release event, so pick
+            # the newest release tag and rebuild that exact revision. This
+            # refreshes the published version on a current base image rather
+            # than publishing whatever happens to be on the default branch.
+            TAG_NAME="$(git tag --sort=-v:refname | awk 'NR==1')"
+            if [ -z "${TAG_NAME}" ]; then
+              # This repo has no releases yet, so there is nothing published
+              # to refresh. Skip cleanly rather than failing a weekly run.
+              echo "::notice::No git tags found; nothing to rebuild yet."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git checkout --force --detach "${TAG_NAME}"
+            echo "Rebuilding release tag ${TAG_NAME}"
+          fi
           echo "REPO_NAME_LC=${REPO_NAME,,}" >> $GITHUB_ENV
           echo "TAG_NAME_LC=${TAG_NAME,,}" >> $GITHUB_ENV
         env:
@@ -40,8 +68,27 @@ jobs:
           TAG_NAME: '${{ github.event.release.tag_name }}'
 
       - name: Push to GitHub Packages
+        if: steps.names.outputs.skip != 'true'
         uses: docker/build-push-action@v6.10.0
         with:
           context: .
           push: true
           tags: ghcr.io/jaycollett/${{ env.REPO_NAME_LC }}:${{ env.TAG_NAME_LC }}, ghcr.io/jaycollett/${{ env.REPO_NAME_LC }}:latest
+
+      # CVE gate aligned with Harbor's policy (CRITICAL/HIGH, fixable only).
+      # On the weekly scheduled rebuild this reports without failing: a CVE
+      # published since the last release must not block the refresh, because
+      # the refresh is what fixes it. Release runs still fail hard.
+      - name: Trivy image scan
+        if: steps.names.outputs.skip != 'true'
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          image-ref: ghcr.io/jaycollett/${{ env.REPO_NAME_LC }}:${{ env.TAG_NAME_LC }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+          format: table
+          exit-code: ${{ github.event_name == 'schedule' && '0' || '1' }}
