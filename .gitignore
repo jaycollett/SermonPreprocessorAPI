@@ -4,3 +4,7 @@
 # Ignore all W4A files
 *.w4a
 /data
+
+# Python caches
+__pycache__/
+.pytest_cache/

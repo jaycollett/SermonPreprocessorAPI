@@ -24,6 +24,32 @@ API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     raise Exception("API_KEY environment variable not set.")
 
+# Extra keys returned by GET /sermons (added on top of the original response shape).
+SERMON_METADATA_FIELDS = (
+    "wp_post_id",
+    "speaker",
+    "series",
+    "gathering",
+    "book",
+    "scripture",
+    "translation",
+    "date_preached",
+    "duration",
+    "summary",
+    "link",
+)
+
+
+def migrate_database():
+    """Apply the idempotent schema migration before serving or scraping."""
+    from background_scraper import ensure_schema, get_database_connection
+    conn, _ = get_database_connection()
+    try:
+        ensure_schema(conn)
+    finally:
+        conn.close()
+
+
 def require_api_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -78,6 +104,10 @@ def get_sermons():
                 "fetched_date": row["fetched_date"],
                 "download_url": request.host_url.rstrip('/') + '/download/' + row["id"]
             }
+            # Metadata from the teaching archive; None until the row is backfilled.
+            row_keys = row.keys()
+            for column in SERMON_METADATA_FIELDS:
+                sermon_data[column] = row[column] if column in row_keys else None
             logger.debug("Sermon retrieved: %s", sermon_data)
             sermons_list.append(sermon_data)
         conn.close()
@@ -117,7 +147,7 @@ def download_sermon_audio(sermon_id):
 
 def background_worker():
     """
-    Background worker that checks the podcast feed for new sermons every 20 minutes.
+    Background worker that checks the tcfky.com teaching archive for new sermons every 20 minutes.
     It calls the process_sermons() function from background_scraper.py.
     """
     logger.info("🟢 Podcast feed worker started. Checking for new sermons every 20 minutes.")
@@ -136,6 +166,7 @@ def background_worker():
 
 
 if __name__ == "__main__":
+    migrate_database()
     worker_thread = threading.Thread(target=background_worker, daemon=True)
     worker_thread.start()
 
