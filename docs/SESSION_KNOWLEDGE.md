@@ -63,7 +63,7 @@ An independent review turned up these, now fixed:
 - **Startup migration** retries 5 times with exponential backoff (1, 2, 4, 8 seconds), then logs and keeps serving. `GET /sermons` copes with the old schema, and every scraper cycle runs the migration again.
 - **Flask debug mode is off by default.** The app ran with `debug=True` on 0.0.0.0, which exposes the Werkzeug debugger. `FLASK_DEBUG=1` turns it on for local work only. Nothing in the Dockerfile, `runIt.sh`, or CI relied on it.
 
-The app still logs at DEBUG level, and `require_api_key` logs the parsed Authorization header, which contains the API key. That is unrelated to the debug flag and was left as is.
+- **The API key is no longer logged.** `require_api_key` used to log the parsed Authorization header at DEBUG, which put the Basic credentials, and so the API key, in the container log on every request. It now logs only whether a key was sent and whether it matched. Logs written before the fix, including the production `docker logs` on devmachine, still contain the key. The key is the same value that is committed in the Dockerfile.
 
 ### Where production runs
 
