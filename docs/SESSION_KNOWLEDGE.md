@@ -24,7 +24,7 @@ Production rows came from the old site, so their `audio_url` values use `http://
 
 1. `wp_post_id` (only after a row has been backfilled once)
 2. exact `audio_url`
-3. normalized file basename from `audio_url` or `file_path` (case-insensitive, query string dropped)
+3. normalized file basename from `audio_url` or `file_path` (case-insensitive, query string dropped), with the upload folder required to agree when both sides have one
 4. normalized title (entities decoded, casefolded, punctuation and whitespace removed), compared against the full old title and each trailing run of its colon-separated segments. A title match needs the preached date to equal the date embedded in the old file name (`tcf.YYYYMMDD*.mp3`) whenever both are known.
 
 Anything uncertain is logged as ambiguous and neither backfilled nor downloaded: several rows for one rule, a row already linked to another post, several posts claiming one row at equal strength, or an unmatched post whose preached date equals the date of an existing row that nothing claimed. Same-date files can be distinct (`tcf.20261021.mp3` and `tcf.20261021a.mp3` are two different talks), so a shared date alone never counts as a match.
@@ -50,6 +50,20 @@ On the 2026-10-26 production copy the filters skip 8 by gathering (5 Mars Hill F
 Each poll cycle downloads at most `MAX_DOWNLOADS_PER_CYCLE` new teachings (default 20; `0` or empty means unlimited; `--max-downloads` overrides it for a manual run). Candidates are taken newest first by preached date, falling back to the WordPress post date, so a new Sunday sermon goes ahead of the 2016 to 2019 backlog. Matching, backfill, title fixes, and filters still cover every item each cycle. Failed downloads use a slot but are not inserted, so the next cycle retries them, and a broken URL can't stall a cycle.
 
 The app's worker sleeps `POLL_INTERVAL_SECONDS` (1200, so 20 minutes) after each cycle finishes, and the first cycle runs only after the first sleep. On the 2026-10-26 production copy the 209-item backlog takes 11 cycles (20 per cycle, 9 in the last), which is about 3h40m of polling plus download time. A stubbed run on a copy matched that: 11 cycles, 209 unique downloads, then a cycle with nothing to do.
+
+### Review hardening (2026-10-26)
+
+An independent review turned up these, now fixed:
+
+- **Overlapping cycles could delete audio.** A manual `python background_scraper.py` run overlapping the worker's cycle could `os.remove()` a file the other process had just inserted a row for. A real cycle now holds an exclusive, non-blocking `flock` on `AUDIO_DIR/.sync.lock` for the whole cycle, and logs and skips if another process has it. Dry runs take no lock. `flock` is advisory and only works between processes on the same host, which covers the container worker and a `docker exec` run against the same bind mount. Separately, `_insert_new` now refuses to download or remove a file whose path already belongs to a row.
+- **Titles repeat across years.** "Kathy's Testimony" exists for 2025 and could appear again. Fifteen production rows have file names without a date (`tcf.philippians.mp3`, the women's retreat sessions), so the date guard can't help for them. The title rules now ignore rows already linked to a different `wp_post_id`. Without that, a new post with a reused title would have been flagged ambiguous on every poll and never ingested.
+- **The same file name can sit in different upload folders.** A basename match now also needs the `wp-content/uploads/YYYY/MM/` folder to agree when both URLs have one. A new post whose file name is already used by an existing row in another folder is reported as ambiguous instead of being downloaded over that row's file. All 650 production basename matches share a folder, so none changed. Three of them have a file-name date that disagrees with the WordPress preached date (for example post 313: preached 2024-10-05, file `tcf.20241105.mp3`). They are the same audio with a typo on one side, and they stay matched.
+- **Downloads are validated** before the `.part` file is renamed into place. The Content-Type must start with `audio/` or `application/octet-stream`, the body must be at least 100 KB, and when the server sends Content-Length with no Content-Encoding, the size must match it exactly. The site sends `audio/mpeg` and a correct Content-Length for mp3s.
+- **One bad row or item no longer stops a cycle.** Backfill updates are caught per row and downloads/inserts per item. Each failure is logged and counted, and failed items are retried next cycle.
+- **Startup migration** retries 5 times with exponential backoff (1, 2, 4, 8 seconds), then logs and keeps serving. `GET /sermons` copes with the old schema, and every scraper cycle runs the migration again.
+- **Flask debug mode is off by default.** The app ran with `debug=True` on 0.0.0.0, which exposes the Werkzeug debugger. `FLASK_DEBUG=1` turns it on for local work only. Nothing in the Dockerfile, `runIt.sh`, or CI relied on it.
+
+The app still logs at DEBUG level, and `require_api_key` logs the parsed Authorization header, which contains the API key. That is unrelated to the debug flag and was left as is.
 
 ### Where production runs
 

@@ -17,6 +17,8 @@ Run directly for a single cycle:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import html
 import logging
 import os
@@ -27,7 +29,7 @@ import time
 import unicodedata
 import uuid
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -56,6 +58,10 @@ DEFAULT_ALLOWED_AUDIO_HOSTS = "tcfky.com,www.tcfky.com"
 DEFAULT_MAX_DOWNLOADS_PER_CYCLE = 20
 # Sleep between cycles in the app's background worker (see app.background_worker).
 POLL_INTERVAL_SECONDS = 1200
+# Downloaded audio must look like audio: an audio/* or octet-stream content type,
+# at least this many bytes, and exactly Content-Length bytes when one is sent.
+MIN_AUDIO_BYTES = 100 * 1024
+SYNC_LOCK_NAME = ".sync.lock"
 API_MAX_PAGES = 200  # hard stop in case the pagination headers are ever wrong
 API_TIMEOUT_SECONDS = 30
 DOWNLOAD_TIMEOUT = (15, 300)  # (connect, read) seconds
@@ -182,6 +188,7 @@ class ExistingRow:
     values: dict[str, Any]
     basenames: frozenset[str] = field(default_factory=frozenset)
     date: str | None = None
+    upload_folder: str | None = None
     title_keys: frozenset[str] = field(default_factory=frozenset)
 
     @property
@@ -221,6 +228,7 @@ class CycleReport:
         default_factory=list
     )  # attempted (or would be) this cycle
     download_cap: int | None = None  # None = unlimited
+    backfill_errors: list[tuple[ExistingRow, str]] = field(default_factory=list)
     # New teachings blocked by ingest filters, with every reason that applies.
     filtered: list[tuple[Teaching, tuple[str, ...]]] = field(default_factory=list)
     # Matched existing rows that would fail a filter (kept and still backfilled).
@@ -279,6 +287,17 @@ def title_keys(title: str | None) -> frozenset[str]:
 
 
 _DATE_IN_NAME = re.compile(r"(?<!\d)(\d{8})(?!\d)")
+
+
+_UPLOAD_FOLDER = re.compile(r"/wp-content/uploads/(\d{4}/\d{2})/", re.IGNORECASE)
+
+
+def upload_folder(url: str | None) -> str | None:
+    """``.../wp-content/uploads/2026/10/x.mp3`` -> ``2026/10``; None if absent."""
+    if not url:
+        return None
+    found = _UPLOAD_FOLDER.search(urlparse(url.strip()).path)
+    return found.group(1) if found else None
 
 
 def date_from_basename(name: str | None) -> str | None:
@@ -487,6 +506,7 @@ def load_existing_rows(conn: sqlite3.Connection) -> list[ExistingRow]:
                 values={c: data[c] for c in meta_cols},
                 basenames=frozenset(names),
                 date=date,
+                upload_folder=upload_folder(data["audio_url"]),
                 title_keys=title_keys(data["title"]),
             )
         )
@@ -515,13 +535,27 @@ def _candidates(
     yield RULE_WP_POST_ID, index["wp"].get(teaching.wp_post_id, [])
     if teaching.audio_url:
         yield RULE_AUDIO_URL, index["url"].get(teaching.audio_url, [])
+        # Same file name in a different upload folder is a different file.
+        folder = upload_folder(teaching.audio_url)
         yield (
             RULE_BASENAME,
-            index["basename"].get(normalize_basename(teaching.audio_url), []),
+            [
+                r
+                for r in index["basename"].get(
+                    normalize_basename(teaching.audio_url), []
+                )
+                if not (folder and r.upload_folder and folder != r.upload_folder)
+            ],
         )
     key = normalize_title(teaching.title)
     if key:
-        by_title = index["title"].get(key, [])
+        # Titles repeat across years; a row already linked to another post is
+        # never a title candidate, so a new post can't be blocked by it.
+        by_title = [
+            r
+            for r in index["title"].get(key, [])
+            if r.wp_post_id is None or r.wp_post_id == teaching.wp_post_id
+        ]
         compatible = [r for r in by_title if _dates_compatible(teaching, r)]
         dated = [r for r in compatible if r.date and teaching.date_preached]
         if dated:
@@ -632,6 +666,18 @@ def match_teachings(
             result.ambiguous.append(
                 (teaching, f"audio URL has no file name: {teaching.audio_url}")
             )
+        elif index["basename"].get(normalize_basename(teaching.audio_url)):
+            # The local file name is taken by an existing row (different upload
+            # folder), so downloading would collide with that row's audio.
+            result.ambiguous.append(
+                (
+                    teaching,
+                    "file name already used by existing row(s): "
+                    + _describe(
+                        index["basename"][normalize_basename(teaching.audio_url)]
+                    ),
+                )
+            )
         elif new_basenames[normalize_basename(teaching.audio_url)] > 1:
             result.ambiguous.append(
                 (
@@ -687,6 +733,23 @@ def backfill_changes(
 # ---------------------------------------------------------------------------
 
 
+def _body_problem(response: Any, size: int) -> str | None:
+    """Why a downloaded body is not acceptable audio, or None if it is."""
+    if size < MIN_AUDIO_BYTES:
+        return f"only {size} bytes (minimum {MIN_AUDIO_BYTES})"
+    expected = response.headers.get("Content-Length")
+    encoding = response.headers.get("Content-Encoding", "identity").lower()
+    # With a content encoding, Content-Length counts encoded bytes, not what we wrote.
+    if (
+        expected
+        and expected.isdigit()
+        and encoding == "identity"
+        and int(expected) != size
+    ):
+        return f"got {size} bytes but Content-Length is {expected}"
+    return None
+
+
 def download_audio(audio_url: str) -> str | None:
     """Download sermon audio and return the local file path, or None on failure."""
     ensure_directories()
@@ -708,8 +771,19 @@ def download_audio(audio_url: str) -> str | None:
                     response.status_code,
                 )
                 return None
+            content_type = response.headers.get("Content-Type", "").lower()
+            if not content_type.startswith(("audio/", "application/octet-stream")):
+                logger.error(
+                    "Refusing %s: Content-Type %r is not audio", audio_url, content_type
+                )
+                return None
             with open(partial, "wb") as f:
                 f.writelines(response.iter_content(64 * 1024))
+            problem = _body_problem(response, os.path.getsize(partial))
+        if problem:
+            logger.error("Refusing %s: %s", audio_url, problem)
+            os.remove(partial)
+            return None
         os.replace(partial, file_path)
         logger.info("Downloaded: %s", file_name)
         return file_path
@@ -728,6 +802,17 @@ def _insert_new(
     assert teaching.audio_url
     file_name = os.path.basename(urlparse(teaching.audio_url).path)
     expected_path = os.path.join(AUDIO_DIR, file_name)
+    owner = conn.execute(
+        "SELECT id FROM sermons WHERE file_path = ?", (expected_path,)
+    ).fetchone()
+    if owner:
+        logger.error(
+            "Not downloading %s: %s already belongs to row %s",
+            teaching.audio_url,
+            expected_path,
+            owner[0],
+        )
+        return False
     # An audio file on disk with no DB row is a leftover from a failed run; re-download it.
     if os.path.exists(expected_path):
         logger.info(
@@ -885,6 +970,25 @@ def recency_key(teaching: Teaching) -> tuple[str, int]:
     )
 
 
+@contextlib.contextmanager
+def sync_lock() -> Iterator[bool]:
+    """Exclusive, non-blocking lock on AUDIO_DIR/.sync.lock for one real cycle.
+
+    Yields False when another process (the app worker or a manual run) holds it.
+    """
+    os.makedirs(AUDIO_DIR, exist_ok=True)
+    with open(os.path.join(AUDIO_DIR, SYNC_LOCK_NAME), "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def process_sermons(
     cursor: sqlite3.Cursor | None,
     conn: sqlite3.Connection,
@@ -899,8 +1003,42 @@ def process_sermons(
 
     ``cursor`` is accepted for backward compatibility with callers that pass
     ``(cursor, conn)``; all work goes through ``conn``. In dry-run mode the
-    database is only read. Returns None if the API could not be fetched.
+    database is only read and no lock is taken. A real cycle holds the sync
+    lock throughout. Returns None if the API could not be fetched or another
+    cycle is already running.
     """
+
+    def run() -> CycleReport | None:
+        return _run_cycle(
+            conn,
+            dry_run=dry_run,
+            teachings=teachings,
+            downloader=downloader,
+            max_downloads=max_downloads,
+            filters=filters,
+        )
+
+    if dry_run:
+        return run()
+    with sync_lock() as acquired:
+        if not acquired:
+            logger.info(
+                "Another sync cycle holds %s, skipping this cycle",
+                os.path.join(AUDIO_DIR, SYNC_LOCK_NAME),
+            )
+            return None
+        return run()
+
+
+def _run_cycle(
+    conn: sqlite3.Connection,
+    *,
+    dry_run: bool = False,
+    teachings: Sequence[Teaching] | None = None,
+    downloader: Callable[[str], str | None] | None = None,
+    max_downloads: int | None = None,
+    filters: IngestFilters | None = None,
+) -> CycleReport | None:
     report = CycleReport(dry_run=dry_run)
     if teachings is None:
         try:
@@ -967,10 +1105,16 @@ def process_sermons(
 
     for row, changes in report.backfills:
         assignments = ", ".join(f"{col} = ?" for col in changes)
-        conn.execute(
-            f"UPDATE sermons SET {assignments} WHERE id = ?",
-            [*changes.values(), row.id],
-        )
+        try:
+            conn.execute(
+                f"UPDATE sermons SET {assignments} WHERE id = ?",
+                [*changes.values(), row.id],
+            )
+        except sqlite3.Error as exc:
+            # One bad row must not block every other row, now or on later cycles.
+            logger.error("Backfill failed for row %s '%s': %s", row.id, row.title, exc)
+            report.backfill_errors.append((row, str(exc)))
+            continue
         if "title" in changes:
             logger.info(
                 "Title updated for %s: '%s' -> '%s'",
@@ -986,7 +1130,17 @@ def process_sermons(
     # Failed downloads use a slot too, so one broken URL can't stall a cycle;
     # they are not inserted, so the next cycle retries them.
     for teaching in report.planned:
-        if _insert_new(conn, teaching, download):
+        try:
+            ok = _insert_new(conn, teaching, download)
+        except Exception:  # per-item boundary: log, count as a failure, keep going
+            logger.exception(
+                "Unexpected error ingesting post %s (%s)",
+                teaching.wp_post_id,
+                teaching.audio_url,
+            )
+            conn.rollback()
+            ok = False
+        if ok:
             report.inserted.append(teaching)
         else:
             report.download_failures.append(teaching)
@@ -1041,6 +1195,7 @@ def format_report(report: CycleReport) -> str:
         counts += [
             ("Inserted this run", len(report.inserted)),
             ("Download failures", len(report.download_failures)),
+            ("Backfill errors", len(report.backfill_errors)),
         ]
     cap = report.download_cap
     backlog = len(result.new)

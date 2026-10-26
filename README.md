@@ -29,6 +29,7 @@ This application:
 - `DB_PATH`: Path to the SQLite database (default: `/data/SermonProcessor.db`)
 - `AUDIO_DIR`: Directory to store downloaded audio files (default: `/data/audiofiles`)
 - `API_KEY`: Required API key for authentication
+- `FLASK_DEBUG`: Set to `1` to run Flask in debug mode for local development only (default: off). Never enable it in production: the debugger can run code from the browser.
 - `API_PAGE_DELAY_SECONDS`: Pause between API pages (default: `1.0`)
 - `SCRAPER_DRY_RUN`: Set to `1` to make `python background_scraper.py` report only
 - `EXCLUDED_GATHERINGS`: `tcf_gathering` names or slugs that are never downloaded, comma-separated and case-insensitive (default: `mars-hill-forum,ordination`). A post with several gatherings is skipped if any one of them is excluded. Set it to an empty string to exclude nothing.

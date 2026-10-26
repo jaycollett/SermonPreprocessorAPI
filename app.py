@@ -40,14 +40,36 @@ SERMON_METADATA_FIELDS = (
 )
 
 
-def migrate_database():
-    """Apply the idempotent schema migration before serving or scraping."""
+def migrate_database(attempts=5, base_delay=1.0, sleep=time.sleep):
+    """Apply the idempotent schema migration before serving or scraping.
+
+    Retries with exponential backoff (e.g. while another process holds the
+    SQLite write lock). If it still fails, log and keep serving: GET /sermons
+    tolerates the old schema and each scraper cycle retries the migration.
+    Returns True when the migration succeeded.
+    """
     from background_scraper import ensure_schema, get_database_connection
-    conn, _ = get_database_connection()
-    try:
-        ensure_schema(conn)
-    finally:
-        conn.close()
+    for attempt in range(1, attempts + 1):
+        try:
+            conn, _ = get_database_connection()
+            try:
+                ensure_schema(conn)
+            finally:
+                conn.close()
+            return True
+        except sqlite3.Error as exc:
+            if attempt == attempts:
+                logger.error("Schema migration failed after %d attempts, serving anyway: %s", attempts, exc)
+                return False
+            delay = base_delay * 2 ** (attempt - 1)
+            logger.warning("Schema migration attempt %d failed (%s), retrying in %.0fs", attempt, exc, delay)
+            sleep(delay)
+    return False
+
+
+def debug_enabled():
+    """Flask debug mode (Werkzeug debugger) is opt-in via FLASK_DEBUG and off by default."""
+    return os.getenv("FLASK_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def require_api_key(f):
@@ -160,11 +182,13 @@ def background_worker():
         try:
             from background_scraper import process_sermons, get_database_connection
             conn, cursor = get_database_connection()
-            process_sermons(cursor, conn)
-            conn.close()
-            logger.info("✅ Podcast feed processing cycle completed successfully.")
+            try:
+                process_sermons(cursor, conn)
+            finally:
+                conn.close()
+            logger.info("✅ Sermon sync cycle finished.")
         except Exception as e:
-            logger.error("❌ Worker error during podcast feed processing: %s", e)
+            logger.error("❌ Worker error during sermon sync: %s", e)
 
 
 if __name__ == "__main__":
@@ -172,5 +196,5 @@ if __name__ == "__main__":
     worker_thread = threading.Thread(target=background_worker, daemon=True)
     worker_thread.start()
 
-    app.run(host="0.0.0.0", port=5060, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=5060, debug=debug_enabled(), use_reloader=False)
 
