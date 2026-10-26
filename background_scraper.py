@@ -95,6 +95,9 @@ RULE_AUDIO_URL = "audio_url"
 RULE_BASENAME = "basename"
 RULE_TITLE_DATE = "title+date"
 RULE_TITLE = "title"
+# Rules that identify the same audio/post; only these may rewrite a row's title.
+STRONG_RULES = frozenset({RULE_WP_POST_ID, RULE_AUDIO_URL, RULE_BASENAME})
+UNTITLED = "Untitled"
 RULE_RANK = {
     RULE_WP_POST_ID: 0,
     RULE_AUDIO_URL: 1,
@@ -289,7 +292,7 @@ def parse_teaching(item: dict[str, Any]) -> Teaching:
 
     return Teaching(
         wp_post_id=int(item["id"]),
-        title=_clean((item.get("title") or {}).get("rendered")) or "Untitled",
+        title=_clean((item.get("title") or {}).get("rendered")) or UNTITLED,
         audio_url=_clean(meta.get("_tcf_audio_url")),
         link=_clean(item.get("link")),
         date_preached=_clean(meta.get("_tcf_date_preached")),
@@ -615,7 +618,26 @@ def match_teachings(
     return result
 
 
-def backfill_changes(row: ExistingRow, teaching: Teaching) -> dict[str, Any]:
+def title_update(row: ExistingRow, teaching: Teaching, rule: str) -> str | None:
+    """New title for ``row``, or None to keep the existing one.
+
+    Only strong identity matches may rename a row. The existing title is kept
+    when the normalized WordPress title is contained in it (old-site titles
+    like "Sermon 10/16: Genesis 4: X" for WP "X"); otherwise the WP title
+    wins, so posts renamed on the site, or first published as a copy of
+    another post, are corrected. Evaluated on every poll, so later renames land.
+    """
+    if rule not in STRONG_RULES or teaching.title == UNTITLED:
+        return None
+    wp_key = normalize_title(teaching.title)
+    if not wp_key or wp_key in normalize_title(row.title):
+        return None
+    return teaching.title
+
+
+def backfill_changes(
+    row: ExistingRow, teaching: Teaching, rule: str | None = None
+) -> dict[str, Any]:
     """Columns on ``row`` that differ from what ``teaching`` says. Empty = no-op."""
     changes = {
         col: val
@@ -626,6 +648,9 @@ def backfill_changes(row: ExistingRow, teaching: Teaching) -> dict[str, Any]:
         derived = teaching.categories()
         if derived != row.categories:
             changes["categories"] = derived
+    new_title = title_update(row, teaching, rule) if rule else None
+    if new_title is not None:
+        changes["title"] = new_title
     return changes
 
 
@@ -748,7 +773,7 @@ def process_sermons(
     report.result = match_teachings(teachings, rows)
 
     for match in report.result.matches:
-        changes = backfill_changes(match.row, match.teaching)
+        changes = backfill_changes(match.row, match.teaching, match.rule)
         if changes:
             report.backfills.append((match.row, changes))
     for teaching, reason in report.result.ambiguous:
@@ -769,6 +794,13 @@ def process_sermons(
             f"UPDATE sermons SET {assignments} WHERE id = ?",
             [*changes.values(), row.id],
         )
+        if "title" in changes:
+            logger.info(
+                "Title updated for %s: '%s' -> '%s'",
+                row.id,
+                row.title,
+                changes["title"],
+            )
     conn.commit()
     if report.backfills:
         logger.info("Backfilled metadata on %d existing rows", len(report.backfills))
@@ -816,6 +848,10 @@ def format_report(report: CycleReport) -> str:
             "Rows would backfill" if report.dry_run else "Rows backfilled",
             len(report.backfills),
         ),
+        (
+            "Titles would change" if report.dry_run else "Titles changed",
+            sum("title" in c for _, c in report.backfills),
+        ),
         (f"New teachings ({verb}ingest)", len(result.new)),
         ("Ambiguous (not ingested)", len(result.ambiguous)),
         ("Skipped, no audio (unmatched)", len(result.skipped_no_audio)),
@@ -829,6 +865,21 @@ def format_report(report: CycleReport) -> str:
         ]
     lines = [f"=== Sermon sync {'DRY RUN' if report.dry_run else 'RUN'} ==="]
     lines += [f"{label + ':':<34}{value}" for label, value in counts]
+
+    renames = [(r, c) for r, c in report.backfills if "title" in c]
+    if renames:
+        lines.append("")
+        lines.append(
+            "--- Titles (would change) ---"
+            if report.dry_run
+            else "--- Titles changed ---"
+        )
+        for r, c in sorted(
+            renames, key=lambda rc: rc[1].get("date_preached") or rc[0].date or ""
+        ):
+            post = c.get("wp_post_id", r.wp_post_id)
+            date = c.get("date_preached") or r.values.get("date_preached") or r.date
+            lines.append(f"    post {post} {date} '{r.title}' -> '{c['title']}'")
 
     by_type: dict[str, list[Teaching]] = defaultdict(list)
     for teaching in result.new:

@@ -31,7 +31,9 @@ Anything uncertain is logged as ambiguous and neither backfilled nor downloaded:
 
 On the 2026-10-26 production copy, all 665 existing rows matched (650 by basename, 15 by exact URL), with 0 ambiguous and 222 new. After the first real run every row has a `wp_post_id`, and the second run matched all 887 by post ID and did nothing else.
 
-Backfill never changes `id`, `title`, `audio_url`, `file_path`, or `fetched_date`. Downstream consumers poll `GET /sermons?date=` by `fetched_date`, so leaving it alone keeps old sermons from being sent back through transcription. `categories` is only filled in when it is empty or "Uncategorized".
+Backfill never changes `id`, `audio_url`, `file_path`, or `fetched_date`.
+
+Titles are handled separately. When a row matches on post ID, exact audio URL, or file basename, the scraper compares titles with the same normalization the matcher uses. If the WordPress title appears inside the existing title, the existing title stays, which keeps old-site names like "Sermon 10/16: Genesis 4: You Are Your Brother's Keeper". Otherwise the row takes the WordPress title and the change is logged at INFO. This runs on every poll, so a later rename on the site reaches the database. A row matched only by title is never renamed. The rule exists because of post 10060: the site published it as a copy of the 10/2 post, the old scraper stored it as "Grace in the Garden" at 01:52 UTC on 2026-10-24, and the site renamed it "Walking with God" at 02:08 UTC. On the production copy this rule renames 2 rows: post 10060, and post 205 ("Sermon 5/17: Acts 21-23: The Passion of Paul" becomes "The Passion of Paul and Ours"). Downstream consumers poll `GET /sermons?date=` by `fetched_date`, so leaving it alone keeps old sermons from being sent back through transcription. `categories` is only filled in when it is empty or "Uncategorized".
 
 ### Where production runs
 

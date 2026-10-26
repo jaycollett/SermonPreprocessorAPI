@@ -252,3 +252,74 @@ def test_backfill_keeps_legacy_categories(legacy_db):
     assert "categories" not in bs.backfill_changes(
         row, teaching(1, "T", url(NEW, "20261023"))
     )
+
+
+def _row(conn):
+    bs.ensure_schema(conn)
+    return bs.load_existing_rows(conn)[0]
+
+
+@pytest.mark.parametrize(
+    ("existing", "wp_title"),
+    [
+        (
+            "Sermon 10/16: Genesis 4: You Are Your Brother’s Keeper",
+            "You Are Your Brother&#8217;s Keeper",
+        ),
+        ("Women’s Breakfast: Rest", "Women’s Breakfast: Rest"),
+        ("Men's Meeting 1/4: Walking with God!", "walking with god"),
+    ],
+)
+def test_title_kept_when_wp_title_contained_in_existing(legacy_db, existing, wp_title):
+    add_row(legacy_db, "a", existing, url(NEW, "20261016"))
+    row = _row(legacy_db)
+    for rule in ("wp_post_id", "audio_url", "basename"):
+        assert (
+            bs.title_update(row, teaching(1, wp_title, url(NEW, "20261016")), rule)
+            is None
+        )
+
+
+@pytest.mark.parametrize("rule", ["wp_post_id", "audio_url", "basename"])
+def test_title_replaced_on_strong_match_when_not_contained(legacy_db, rule):
+    add_row(legacy_db, "a", "Grace in the Garden", url(NEW, "20261023"))
+    row = _row(legacy_db)
+    t = teaching(10060, "Walking with God", url(NEW, "20261023"))
+    assert bs.title_update(row, t, rule) == "Walking with God"
+    assert bs.backfill_changes(row, t, rule)["title"] == "Walking with God"
+
+
+@pytest.mark.parametrize("rule", ["title+date", "title", None])
+def test_title_never_changed_by_title_rule_or_without_rule(legacy_db, rule):
+    add_row(legacy_db, "a", "Grace in the Garden", url(NEW, "20261023"))
+    row = _row(legacy_db)
+    assert "title" not in bs.backfill_changes(
+        row, teaching(1, "Walking with God", url(NEW, "20261023")), rule
+    )
+
+
+def test_untitled_placeholder_never_overwrites(legacy_db):
+    add_row(legacy_db, "a", "Real Title", url(NEW, "20261023"))
+    row = _row(legacy_db)
+    assert (
+        bs.title_update(row, teaching(1, bs.UNTITLED, url(NEW, "20261023")), "basename")
+        is None
+    )
+
+
+def test_title_rule_match_end_to_end_keeps_title(legacy_db, audio_dir):
+    add_row(
+        legacy_db,
+        "r1",
+        "Sermon 2/21: Amos: God’s Glorious Future",
+        url(OLD, "20250221"),
+    )
+    t2 = teaching(5, "God’s Glorious Future", "https://cdn.example/x.mp3", "2025-02-21")
+    report = bs.process_sermons(
+        None, legacy_db, teachings=[t2], downloader=lambda u: None
+    )
+    assert report.result.matches[0].rule == "title+date"
+    assert (
+        legacy_db.execute("SELECT title FROM sermons").fetchone()[0]
+        == "Sermon 2/21: Amos: God’s Glorious Future"
+    )
