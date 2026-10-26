@@ -1,7 +1,7 @@
 import base64
 
 import pytest
-from conftest import add_row
+from conftest import TEST_API_KEY, add_row
 
 import app as app_module
 import background_scraper as bs
@@ -14,7 +14,10 @@ def client(legacy_db, monkeypatch):
     return app_module.app.test_client()
 
 
-AUTH = {"Authorization": "Basic " + base64.b64encode(b"user:test-key").decode()}
+AUTH = {
+    "Authorization": "Basic "
+    + base64.b64encode(f"user:{TEST_API_KEY}".encode()).decode()
+}
 LEGACY_KEYS = {"id", "title", "audio_url", "categories", "fetched_date", "download_url"}
 
 
@@ -56,3 +59,44 @@ def test_migrate_database_is_idempotent(legacy_db, monkeypatch):
     assert "gathering" in [
         r[1] for r in legacy_db.execute("PRAGMA table_info(sermons)")
     ]
+
+
+SECRET = TEST_API_KEY
+
+
+def _leaks(text):
+    encoded = base64.b64encode(f"user:{SECRET}".encode()).decode()
+    return [
+        needle
+        for needle in (SECRET, SECRET[:5], SECRET[-4:], "sentinel", encoded)
+        if needle in text
+    ]
+
+
+@pytest.mark.parametrize(
+    ("password", "status"),
+    [(SECRET, 200), ("wrong-" + SECRET, 401), ("", 401)],
+)
+def test_auth_logging_never_includes_key(client, legacy_db, caplog, password, status):
+    add_row(
+        legacy_db, "a", "T", "https://tcfky.com/x/a.mp3", fetched="2026-10-24 00:00:00"
+    )
+    header = {
+        "Authorization": "Basic "
+        + base64.b64encode(f"user:{password}".encode()).decode()
+    }
+    with caplog.at_level("DEBUG"):
+        response = client.get("/sermons?date=2026-10-01", headers=header)
+        client.get("/download/a", headers=header)
+    assert response.status_code == status
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert _leaks(logged) == []
+    assert "API key present:" in logged
+
+
+def test_missing_auth_logs_presence_only(client, caplog):
+    with caplog.at_level("DEBUG"):
+        assert client.get("/sermons?date=2026-10-01").status_code == 401
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert _leaks(logged) == []
+    assert "API key present: False" in logged

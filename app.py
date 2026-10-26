@@ -1,3 +1,4 @@
+import hmac
 import os
 import sqlite3
 import logging
@@ -75,10 +76,14 @@ def debug_enabled():
 def require_api_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
+        # Never log the header or the key itself, only whether one was sent and matched.
         auth = request.authorization
-        logger.debug("Authorization header received: %s", auth)
-        if not auth or auth.password != API_KEY:
-            logger.warning("Unauthorized access attempt.")
+        supplied = auth.password if auth else None
+        key_present = bool(supplied)
+        key_valid = key_present and hmac.compare_digest(supplied.encode(), API_KEY.encode())
+        logger.debug("API key present: %s, valid: %s", key_present, key_valid)
+        if not key_valid:
+            logger.warning("Unauthorized access attempt (API key present: %s).", key_present)
             abort(401, description="Unauthorized: Invalid API key.")
         return f(*args, **kwargs)
     return decorated

@@ -9,7 +9,9 @@ import pytest
 # Module-level config in app.py / background_scraper.py is read at import time,
 # so point it somewhere harmless before either is imported.
 _IMPORT_DIR = tempfile.mkdtemp(prefix="sermon-tests-")
-os.environ.setdefault("API_KEY", "test-key")
+# A distinctive key so log-leak tests can search for it (or fragments of it).
+TEST_API_KEY = "Zq9Vx-sentinel-K3y"
+os.environ["API_KEY"] = TEST_API_KEY
 os.environ["DB_PATH"] = os.path.join(_IMPORT_DIR, "import.db")
 os.environ["AUDIO_DIR"] = os.path.join(_IMPORT_DIR, "audio")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
