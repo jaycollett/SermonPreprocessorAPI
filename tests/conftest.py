@@ -70,3 +70,16 @@ def teaching(post_id, title, audio_url, date=None, gathering="Sermon", **kw):
         series=kw.pop("series", None),
         **kw,
     )
+
+
+@pytest.fixture(autouse=True)
+def _clean_scraper_env(monkeypatch):
+    """Tests start from the documented defaults unless they set a var themselves."""
+    for name in (
+        "EXCLUDED_GATHERINGS",
+        "ALLOWED_AUDIO_EXTENSIONS",
+        "ALLOWED_AUDIO_HOSTS",
+        "MAX_DOWNLOADS_PER_CYCLE",
+        "SCRAPER_DRY_RUN",
+    ):
+        monkeypatch.delenv(name, raising=False)

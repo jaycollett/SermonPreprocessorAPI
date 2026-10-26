@@ -45,6 +45,12 @@ Three filters decide which new teachings get downloaded. They run after matching
 
 On the 2026-10-26 production copy the filters skip 8 by gathering (5 Mars Hill Forum, 3 Ordination), 4 by extension (`.m4a`), and 1 by host (`lcf.cfchurches.com`). No post failed more than one filter, which takes new ingestion from 222 to 209. Two existing production rows would fail a filter and are kept: the 2023 Mars Hill Forum talk (post 385) and an `.m4a` reading of a George MacDonald sermon (post 400). So production already holds one `.m4a` file.
 
+### Download cap
+
+Each poll cycle downloads at most `MAX_DOWNLOADS_PER_CYCLE` new teachings (default 20; `0` or empty means unlimited; `--max-downloads` overrides it for a manual run). Candidates are taken newest first by preached date, falling back to the WordPress post date, so a new Sunday sermon goes ahead of the 2016 to 2019 backlog. Matching, backfill, title fixes, and filters still cover every item each cycle. Failed downloads use a slot but are not inserted, so the next cycle retries them, and a broken URL can't stall a cycle.
+
+The app's worker sleeps `POLL_INTERVAL_SECONDS` (1200, so 20 minutes) after each cycle finishes, and the first cycle runs only after the first sleep. On the 2026-10-26 production copy the 209-item backlog takes 11 cycles (20 per cycle, 9 in the last), which is about 3h40m of polling plus download time. A stubbed run on a copy matched that: 11 cycles, 209 unique downloads, then a cycle with nothing to do.
+
 ### Where production runs
 
 Production is not on K3S. It runs as a plain Docker container named `sermonpreprocessor` (image `sermonpreprocessor:latest`, built locally from `runIt.sh`) on devmachine (192.168.0.228), next to the `sermonorchestrator` container, which reaches it at `host.docker.internal:5060`. The data directory is bind-mounted from `/home/jay/SourceCode/SermonPreprocessorAPI/data` to `/data`. The GitHub workflow publishes to ghcr.io, but the running container uses the locally built image.

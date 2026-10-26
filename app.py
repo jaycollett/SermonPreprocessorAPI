@@ -150,10 +150,12 @@ def background_worker():
     Background worker that checks the tcfky.com teaching archive for new sermons every 20 minutes.
     It calls the process_sermons() function from background_scraper.py.
     """
-    logger.info("🟢 Podcast feed worker started. Checking for new sermons every 20 minutes.")
+    from background_scraper import POLL_INTERVAL_SECONDS
+
+    logger.info("🟢 Sermon worker started. Checking for new sermons every %d seconds.", POLL_INTERVAL_SECONDS)
     while True:
-        logger.info("⏳ Worker sleeping for 20 minutes...")
-        time.sleep(1200)  # 1200 seconds = 20 minutes
+        logger.info("⏳ Worker sleeping for %d seconds...", POLL_INTERVAL_SECONDS)
+        time.sleep(POLL_INTERVAL_SECONDS)
         logger.info("🔍 Worker waking up to check for new sermons...")
         try:
             from background_scraper import process_sermons, get_database_connection

@@ -52,6 +52,10 @@ DEFAULT_EXCLUDED_GATHERINGS = "mars-hill-forum,ordination"
 # Allowlists for new downloads (comma-separated, case-insensitive; empty = allow any).
 DEFAULT_ALLOWED_AUDIO_EXTENSIONS = "mp3"
 DEFAULT_ALLOWED_AUDIO_HOSTS = "tcfky.com,www.tcfky.com"
+# New downloads per poll cycle (newest first); 0 or empty = unlimited.
+DEFAULT_MAX_DOWNLOADS_PER_CYCLE = 20
+# Sleep between cycles in the app's background worker (see app.background_worker).
+POLL_INTERVAL_SECONDS = 1200
 API_MAX_PAGES = 200  # hard stop in case the pagination headers are ever wrong
 API_TIMEOUT_SECONDS = 30
 DOWNLOAD_TIMEOUT = (15, 300)  # (connect, read) seconds
@@ -137,6 +141,7 @@ class Teaching:
     book: str | None = None
     modified: str | None = None
     gathering_slugs: tuple[str, ...] = ()
+    published: str | None = None  # WP post date, fallback when date_preached is missing
 
     def metadata(self) -> dict[str, Any]:
         """Column values this teaching contributes to a ``sermons`` row."""
@@ -212,6 +217,10 @@ class CycleReport:
     inserted: list[Teaching] = field(default_factory=list)
     download_failures: list[Teaching] = field(default_factory=list)
     deferred: list[Teaching] = field(default_factory=list)
+    planned: list[Teaching] = field(
+        default_factory=list
+    )  # attempted (or would be) this cycle
+    download_cap: int | None = None  # None = unlimited
     # New teachings blocked by ingest filters, with every reason that applies.
     filtered: list[tuple[Teaching, tuple[str, ...]]] = field(default_factory=list)
     # Matched existing rows that would fail a filter (kept and still backfilled).
@@ -323,6 +332,7 @@ def parse_teaching(item: dict[str, Any]) -> Teaching:
         gathering_slugs=tuple(slugs),
         book=joined("tcf_teaching_book"),
         modified=_clean(item.get("modified")),
+        published=_clean(item.get("date")),
     )
 
 
@@ -847,6 +857,34 @@ class IngestFilters:
         return tuple(failed)
 
 
+def configured_max_downloads() -> int | None:
+    """MAX_DOWNLOADS_PER_CYCLE: unset = default (20); 0 or empty = unlimited."""
+    raw = os.getenv("MAX_DOWNLOADS_PER_CYCLE")
+    if raw is None:
+        return DEFAULT_MAX_DOWNLOADS_PER_CYCLE
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid MAX_DOWNLOADS_PER_CYCLE=%r, using %d",
+            raw,
+            DEFAULT_MAX_DOWNLOADS_PER_CYCLE,
+        )
+        return DEFAULT_MAX_DOWNLOADS_PER_CYCLE
+    return value if value > 0 else None
+
+
+def recency_key(teaching: Teaching) -> tuple[str, int]:
+    """Sort key for newest-first ingestion: preached date, else WP post date."""
+    return (
+        teaching.date_preached or (teaching.published or "")[:10],
+        teaching.wp_post_id,
+    )
+
+
 def process_sermons(
     cursor: sqlite3.Cursor | None,
     conn: sqlite3.Connection,
@@ -914,6 +952,16 @@ def process_sermons(
             reason,
         )
 
+    # Newest first so a new Sunday sermon is never stuck behind the backlog.
+    # max_downloads: None = MAX_DOWNLOADS_PER_CYCLE, 0 = unlimited.
+    cap = (
+        configured_max_downloads() if max_downloads is None else (max_downloads or None)
+    )
+    report.download_cap = cap
+    queue = sorted(report.result.new, key=recency_key, reverse=True)
+    report.planned = queue if cap is None else queue[:cap]
+    report.deferred = [] if cap is None else queue[cap:]
+
     if dry_run:
         return report
 
@@ -935,15 +983,9 @@ def process_sermons(
         logger.info("Backfilled metadata on %d existing rows", len(report.backfills))
 
     download = downloader or download_audio
-    for teaching in sorted(
-        report.result.new, key=lambda t: (t.date_preached or "", t.wp_post_id)
-    ):
-        if (
-            max_downloads is not None
-            and len(report.inserted) + len(report.download_failures) >= max_downloads
-        ):
-            report.deferred.append(teaching)
-            continue
+    # Failed downloads use a slot too, so one broken URL can't stall a cycle;
+    # they are not inserted, so the next cycle retries them.
+    for teaching in report.planned:
         if _insert_new(conn, teaching, download):
             report.inserted.append(teaching)
         else:
@@ -964,7 +1006,7 @@ def process_sermons(
 def format_report(report: CycleReport) -> str:
     result = report.result
     verb = "would " if report.dry_run else ""
-    counts: list[tuple[str, int]] = [
+    counts: list[tuple[str, object]] = [
         ("API teachings fetched", report.api_items),
         ("Matched existing rows", len(result.matches)),
     ]
@@ -999,10 +1041,38 @@ def format_report(report: CycleReport) -> str:
         counts += [
             ("Inserted this run", len(report.inserted)),
             ("Download failures", len(report.download_failures)),
-            ("Deferred by download limit", len(report.deferred)),
         ]
+    cap = report.download_cap
+    backlog = len(result.new)
+    cycles = 0 if not backlog else (1 if cap is None else -(-backlog // cap))
+    minutes = POLL_INTERVAL_SECONDS // 60
+    counts += [
+        ("Download cap per cycle", cap if cap is not None else "unlimited"),
+        (
+            "Would download this cycle"
+            if report.dry_run
+            else "Download attempts this cycle",
+            len(report.planned),
+        ),
+        ("Deferred to later cycles", len(report.deferred)),
+        (
+            "Cycles to drain new backlog",
+            (
+                f"{cycles} (poll every {minutes} min plus cycle time, about "
+                f"{cycles * minutes // 60}h{cycles * minutes % 60:02d}m)"
+            ),
+        ),
+    ]
     lines = [f"=== Sermon sync {'DRY RUN' if report.dry_run else 'RUN'} ==="]
     lines += [f"{label + ':':<34}{value}" for label, value in counts]
+
+    if report.dry_run and report.planned and report.deferred:
+        lines.append("")
+        lines.append(f"--- Would download this cycle (newest first, cap {cap}) ---")
+        for t in report.planned:
+            lines.append(
+                f"    {recency_key(t)[0] or '????-??-??'}  {t.title}  (post {t.wp_post_id})"
+            )
 
     renames = [(r, c) for r, c in report.backfills if "title" in c]
     if renames:
@@ -1092,7 +1162,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--max-downloads",
         type=int,
         default=None,
-        help="cap new downloads this cycle; the rest are picked up next cycle",
+        help="cap new downloads this cycle (overrides MAX_DOWNLOADS_PER_CYCLE; 0 = unlimited)",
     )
     args = parser.parse_args(argv)
 

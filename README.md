@@ -17,7 +17,7 @@ This application:
 - Reads the WordPress REST API (`/wp-json/wp/v2/tcf_teaching`) with a browser-style Accept header, which the host's firewall requires
 - Adds metadata columns to the `sermons` table with an idempotent migration at startup
 - Audio files are stored locally and tracked in a SQLite database
-- Runs a background worker to automatically check for new sermons every 20 minutes
+- Runs a background worker that sleeps 20 minutes (`POLL_INTERVAL_SECONDS` in `background_scraper.py`) between cycles
 
 ## API Endpoints
 
@@ -34,12 +34,13 @@ This application:
 - `EXCLUDED_GATHERINGS`: `tcf_gathering` names or slugs that are never downloaded, comma-separated and case-insensitive (default: `mars-hill-forum,ordination`). A post with several gatherings is skipped if any one of them is excluded. Set it to an empty string to exclude nothing.
 - `ALLOWED_AUDIO_EXTENSIONS`: File extensions allowed for new downloads, taken from the URL path with the query string ignored (default: `mp3`). Empty allows any extension.
 - `ALLOWED_AUDIO_HOSTS`: Hosts allowed for new downloads (default: `tcfky.com,www.tcfky.com`). Empty allows any host.
+- `MAX_DOWNLOADS_PER_CYCLE`: New downloads per poll cycle, newest first by preached date (WordPress post date when that is missing) (default: `20`). `0` or an empty value means unlimited. Failed downloads count toward the cap and are retried on later cycles. The `--max-downloads` flag overrides it for a manual run.
 
 ## Dry run and manual runs
 
 ```bash
 python background_scraper.py --dry-run --db /data/SermonProcessor.db   # read-only report, no downloads
-python background_scraper.py --max-downloads 10                        # one real cycle, capped
+python background_scraper.py --max-downloads 10                        # one real cycle, cap overridden (0 = unlimited)
 ```
 
 ## Tests
