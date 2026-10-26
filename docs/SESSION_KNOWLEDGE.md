@@ -35,6 +35,16 @@ Backfill never changes `id`, `audio_url`, `file_path`, or `fetched_date`.
 
 Titles are handled separately. When a row matches on post ID, exact audio URL, or file basename, the scraper compares titles with the same normalization the matcher uses. If the WordPress title appears inside the existing title, the existing title stays, which keeps old-site names like "Sermon 10/16: Genesis 4: You Are Your Brother's Keeper". Otherwise the row takes the WordPress title and the change is logged at INFO. This runs on every poll, so a later rename on the site reaches the database. A row matched only by title is never renamed. The rule exists because of post 10060: the site published it as a copy of the 10/2 post, the old scraper stored it as "Grace in the Garden" at 01:52 UTC on 2026-10-24, and the site renamed it "Walking with God" at 02:08 UTC. On the production copy this rule renames 2 rows: post 10060, and post 205 ("Sermon 5/17: Acts 21-23: The Passion of Paul" becomes "The Passion of Paul and Ours"). Downstream consumers poll `GET /sermons?date=` by `fetched_date`, so leaving it alone keeps old sermons from being sent back through transcription. `categories` is only filled in when it is empty or "Uncategorized".
 
+### Ingest filters
+
+Three filters decide which new teachings get downloaded. They run after matching, so they never stop an existing row from being matched, backfilled, or retitled, and they never delete anything.
+
+- `EXCLUDED_GATHERINGS` (default `mars-hill-forum,ordination`). The real slugs come from `/wp-json/wp/v2/tcf_gathering`. Names and slugs are compared after stripping punctuation and case, so "Mars Hill Forum" and `mars-hill-forum` both work. If a post has several gatherings and any one is excluded, the post is skipped.
+- `ALLOWED_AUDIO_EXTENSIONS` (default `mp3`), read from the URL path with the query string ignored.
+- `ALLOWED_AUDIO_HOSTS` (default `tcfky.com,www.tcfky.com`), compared exactly against the URL's host.
+
+On the 2026-10-26 production copy the filters skip 8 by gathering (5 Mars Hill Forum, 3 Ordination), 4 by extension (`.m4a`), and 1 by host (`lcf.cfchurches.com`). No post failed more than one filter, which takes new ingestion from 222 to 209. Two existing production rows would fail a filter and are kept: the 2023 Mars Hill Forum talk (post 385) and an `.m4a` reading of a George MacDonald sermon (post 400). So production already holds one `.m4a` file.
+
 ### Where production runs
 
 Production is not on K3S. It runs as a plain Docker container named `sermonpreprocessor` (image `sermonpreprocessor:latest`, built locally from `runIt.sh`) on devmachine (192.168.0.228), next to the `sermonorchestrator` container, which reaches it at `host.docker.internal:5060`. The data directory is bind-mounted from `/home/jay/SourceCode/SermonPreprocessorAPI/data` to `/data`. The GitHub workflow publishes to ghcr.io, but the running container uses the locally built image.

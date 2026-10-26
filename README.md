@@ -7,7 +7,7 @@ A microservice that monitors Trinity Christian Fellowship's teaching archive (th
 This application:
 1. Periodically pages through the `tcf_teaching` REST API for new teachings of every type that has audio
 2. Matches each teaching against existing rows (post ID, audio URL, file name, then title plus date) so nothing already stored is downloaded again, backfilling metadata onto matched rows
-3. Downloads audio for genuinely new teachings
+3. Downloads audio for genuinely new teachings that pass the ingest filters (gathering type, file extension, audio host). The filters never delete or change existing rows.
 4. Stores information in a SQLite database
 5. Provides an API to retrieve sermon information and audio files
 
@@ -31,6 +31,9 @@ This application:
 - `API_KEY`: Required API key for authentication
 - `API_PAGE_DELAY_SECONDS`: Pause between API pages (default: `1.0`)
 - `SCRAPER_DRY_RUN`: Set to `1` to make `python background_scraper.py` report only
+- `EXCLUDED_GATHERINGS`: `tcf_gathering` names or slugs that are never downloaded, comma-separated and case-insensitive (default: `mars-hill-forum,ordination`). A post with several gatherings is skipped if any one of them is excluded. Set it to an empty string to exclude nothing.
+- `ALLOWED_AUDIO_EXTENSIONS`: File extensions allowed for new downloads, taken from the URL path with the query string ignored (default: `mp3`). Empty allows any extension.
+- `ALLOWED_AUDIO_HOSTS`: Hosts allowed for new downloads (default: `tcfky.com,www.tcfky.com`). Empty allows any host.
 
 ## Dry run and manual runs
 

@@ -46,6 +46,12 @@ logger = logging.getLogger(__name__)
 WP_API_URL = os.getenv("WP_API_URL", "https://tcfky.com/wp-json/wp/v2/tcf_teaching")
 API_PAGE_SIZE = 100
 API_PAGE_DELAY_SECONDS = float(os.getenv("API_PAGE_DELAY_SECONDS", "1.0"))
+# Gatherings (tcf_gathering names or slugs, comma-separated, case-insensitive)
+# that are never downloaded or inserted. Existing rows are left alone.
+DEFAULT_EXCLUDED_GATHERINGS = "mars-hill-forum,ordination"
+# Allowlists for new downloads (comma-separated, case-insensitive; empty = allow any).
+DEFAULT_ALLOWED_AUDIO_EXTENSIONS = "mp3"
+DEFAULT_ALLOWED_AUDIO_HOSTS = "tcfky.com,www.tcfky.com"
 API_MAX_PAGES = 200  # hard stop in case the pagination headers are ever wrong
 API_TIMEOUT_SECONDS = 30
 DOWNLOAD_TIMEOUT = (15, 300)  # (connect, read) seconds
@@ -130,6 +136,7 @@ class Teaching:
     gathering: str | None = None
     book: str | None = None
     modified: str | None = None
+    gathering_slugs: tuple[str, ...] = ()
 
     def metadata(self) -> dict[str, Any]:
         """Column values this teaching contributes to a ``sermons`` row."""
@@ -205,6 +212,12 @@ class CycleReport:
     inserted: list[Teaching] = field(default_factory=list)
     download_failures: list[Teaching] = field(default_factory=list)
     deferred: list[Teaching] = field(default_factory=list)
+    # New teachings blocked by ingest filters, with every reason that applies.
+    filtered: list[tuple[Teaching, tuple[str, ...]]] = field(default_factory=list)
+    # Matched existing rows that would fail a filter (kept and still backfilled).
+    existing_failing_filters: list[tuple[Match, tuple[str, ...]]] = field(
+        default_factory=list
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -280,12 +293,16 @@ def parse_teaching(item: dict[str, Any]) -> Teaching:
     """Convert one REST API item (with ``_embed=wp:term``) into a Teaching."""
     meta = item.get("meta") or {}
     terms: dict[str, list[str]] = defaultdict(list)
+    slugs: list[str] = []
     for group in (item.get("_embedded") or {}).get("wp:term") or []:
         for term in group or []:
             name = _clean(term.get("name"))
             taxonomy = term.get("taxonomy")
             if name and taxonomy and name not in terms[taxonomy]:
                 terms[taxonomy].append(name)
+            slug = _clean(term.get("slug"))
+            if taxonomy == "tcf_gathering" and slug and slug not in slugs:
+                slugs.append(slug)
 
     def joined(taxonomy: str) -> str | None:
         return ", ".join(terms[taxonomy]) or None
@@ -303,6 +320,7 @@ def parse_teaching(item: dict[str, Any]) -> Teaching:
         speaker=joined("tcf_speaker"),
         series=joined("tcf_teaching_series"),
         gathering=joined("tcf_gathering"),
+        gathering_slugs=tuple(slugs),
         book=joined("tcf_teaching_book"),
         modified=_clean(item.get("modified")),
     )
@@ -743,6 +761,92 @@ def _insert_new(
     return True
 
 
+FILTER_GATHERING = "gathering"
+FILTER_EXTENSION = "extension"
+FILTER_HOST = "host"
+FILTER_ORDER = (FILTER_GATHERING, FILTER_EXTENSION, FILTER_HOST)
+
+
+def _gathering_key(value: str) -> str:
+    # "Mars Hill Forum", "mars-hill-forum" and "MARS HILL FORUM" all compare equal.
+    return normalize_title(value)
+
+
+def _env_list(name: str, default: str) -> list[str]:
+    """Comma-separated env var; unset means ``default``, empty means no entries."""
+    return [p.strip() for p in os.getenv(name, default).split(",") if p.strip()]
+
+
+def configured_excluded_gatherings() -> frozenset[str]:
+    """Normalized gathering keys from EXCLUDED_GATHERINGS (unset = default, empty = none)."""
+    raw = _env_list("EXCLUDED_GATHERINGS", DEFAULT_EXCLUDED_GATHERINGS)
+    return frozenset(k for k in (_gathering_key(p) for p in raw) if k)
+
+
+def is_excluded(teaching: Teaching, excluded: frozenset[str]) -> bool:
+    """True if any of the teaching's gatherings (by name or slug) is excluded."""
+    if not excluded:
+        return False
+    keys = {_gathering_key(n) for n in _split_joined(teaching.gathering)}
+    keys |= {_gathering_key(s) for s in teaching.gathering_slugs}
+    return bool(keys & excluded)
+
+
+def audio_extension(url: str | None) -> str:
+    """Lower-cased extension of the URL path without the dot (query string ignored)."""
+    name = normalize_basename(url) or ""
+    return os.path.splitext(name)[1].lstrip(".")
+
+
+def audio_host(url: str | None) -> str:
+    return (urlparse((url or "").strip()).hostname or "").lower()
+
+
+@dataclass(frozen=True)
+class IngestFilters:
+    """Rules that block new downloads. They never touch existing rows."""
+
+    excluded_gatherings: frozenset[str] = frozenset()
+    allowed_extensions: frozenset[str] = frozenset()  # empty = any
+    allowed_hosts: frozenset[str] = frozenset()  # empty = any
+
+    @classmethod
+    def from_env(cls) -> IngestFilters:
+        return cls(
+            excluded_gatherings=configured_excluded_gatherings(),
+            allowed_extensions=frozenset(
+                e.lower().lstrip(".")
+                for e in _env_list(
+                    "ALLOWED_AUDIO_EXTENSIONS", DEFAULT_ALLOWED_AUDIO_EXTENSIONS
+                )
+            ),
+            allowed_hosts=frozenset(
+                h.lower()
+                for h in _env_list("ALLOWED_AUDIO_HOSTS", DEFAULT_ALLOWED_AUDIO_HOSTS)
+            ),
+        )
+
+    def reasons(
+        self, teaching: Teaching, audio_url: str | None = None
+    ) -> tuple[str, ...]:
+        """Every filter the teaching fails, in FILTER_ORDER. Empty = allowed.
+
+        ``audio_url`` overrides the teaching's URL (used to check an existing row's file).
+        """
+        url = audio_url if audio_url is not None else teaching.audio_url
+        failed = []
+        if is_excluded(teaching, self.excluded_gatherings):
+            failed.append(FILTER_GATHERING)
+        if (
+            self.allowed_extensions
+            and audio_extension(url) not in self.allowed_extensions
+        ):
+            failed.append(FILTER_EXTENSION)
+        if self.allowed_hosts and audio_host(url) not in self.allowed_hosts:
+            failed.append(FILTER_HOST)
+        return tuple(failed)
+
+
 def process_sermons(
     cursor: sqlite3.Cursor | None,
     conn: sqlite3.Connection,
@@ -751,6 +855,7 @@ def process_sermons(
     teachings: Sequence[Teaching] | None = None,
     downloader: Callable[[str], str | None] | None = None,
     max_downloads: int | None = None,
+    filters: IngestFilters | None = None,
 ) -> CycleReport | None:
     """Run one fetch/match/backfill/ingest cycle.
 
@@ -771,6 +876,30 @@ def process_sermons(
         ensure_schema(conn)
     rows = load_existing_rows(conn)
     report.result = match_teachings(teachings, rows)
+
+    # Ingest filters only block new downloads and inserts. Matched rows are
+    # still backfilled and are never deleted because of a filter.
+    active = filters if filters is not None else IngestFilters.from_env()
+    allowed: list[Teaching] = []
+    for teaching in report.result.new:
+        failed = active.reasons(teaching)
+        if failed:
+            report.filtered.append((teaching, failed))
+            logger.info(
+                "Filtered (%s), not ingested: post %s '%s' (%s) %s",
+                "+".join(failed),
+                teaching.wp_post_id,
+                teaching.title,
+                teaching.date_preached,
+                teaching.audio_url,
+            )
+        else:
+            allowed.append(teaching)
+    report.result.new = allowed
+    for match in report.result.matches:
+        failed = active.reasons(match.teaching, match.row.audio_url)
+        if failed:
+            report.existing_failing_filters.append((match, failed))
 
     for match in report.result.matches:
         changes = backfill_changes(match.row, match.teaching, match.rule)
@@ -853,6 +982,15 @@ def format_report(report: CycleReport) -> str:
             sum("title" in c for _, c in report.backfills),
         ),
         (f"New teachings ({verb}ingest)", len(result.new)),
+        *(
+            (
+                f"Skipped by {reason} filter",
+                sum(reason in r for _, r in report.filtered),
+            )
+            for reason in FILTER_ORDER
+        ),
+        ("  caught by more than one", sum(len(r) > 1 for _, r in report.filtered)),
+        ("Existing rows failing a filter", len(report.existing_failing_filters)),
         ("Ambiguous (not ingested)", len(result.ambiguous)),
         ("Skipped, no audio (unmatched)", len(result.skipped_no_audio)),
         ("Existing rows unmatched", len(result.unmatched_rows)),
@@ -895,6 +1033,33 @@ def format_report(report: CycleReport) -> str:
                 lines.append(
                     f"    {t.date_preached or '????-??-??'}  {t.title}  (post {t.wp_post_id})"
                 )
+    for reason in FILTER_ORDER:
+        hits = [(t, why) for t, why in report.filtered if reason in why]
+        if not hits:
+            continue
+        lines.append("")
+        lines.append(f"--- Skipped by {reason} filter (never ingested) ---")
+        for t, why in sorted(
+            hits, key=lambda tr: tr[0].date_preached or "", reverse=True
+        ):
+            also = (
+                f"  [also: {', '.join(x for x in why if x != reason)}]"
+                if len(why) > 1
+                else ""
+            )
+            lines.append(
+                f"    {t.date_preached or '????-??-??'}  [{t.gathering or '(no gathering)'}]  {t.title}"
+                f"  (post {t.wp_post_id}) {t.audio_url}{also}"
+            )
+    if report.existing_failing_filters:
+        lines.append("")
+        lines.append("--- Existing rows failing a filter (kept, still backfilled) ---")
+        for m, why in report.existing_failing_filters:
+            lines.append(
+                f"    {m.row.id} {m.teaching.date_preached} [{m.teaching.gathering or '(no gathering)'}] "
+                f"'{m.row.title}' (post {m.teaching.wp_post_id}) {m.row.audio_url}"
+                f"  fails: {', '.join(why)}"
+            )
     if result.ambiguous:
         lines.append("")
         lines.append("--- Ambiguous ---")

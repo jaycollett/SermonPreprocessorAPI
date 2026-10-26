@@ -28,8 +28,16 @@ def api_item(
                 [{"name": "Kelly Hahn", "taxonomy": "tcf_speaker"}],
                 [{"name": "Genesis", "taxonomy": "tcf_teaching_series"}],
                 [
-                    {"name": "Testimonies", "taxonomy": "tcf_gathering"},
-                    {"name": "Women&#8217;s Retreat", "taxonomy": "tcf_gathering"},
+                    {
+                        "name": "Testimonies",
+                        "slug": "testimonies",
+                        "taxonomy": "tcf_gathering",
+                    },
+                    {
+                        "name": "Women&#8217;s Retreat",
+                        "slug": "womens-retreat",
+                        "taxonomy": "tcf_gathering",
+                    },
                 ],
                 [{"name": "Genesis", "taxonomy": "tcf_teaching_book"}],
             ]
@@ -70,6 +78,7 @@ def test_parse_teaching_extracts_meta_and_terms():
     assert t.title == "God’s & Man"
     assert t.speaker == "Kelly Hahn" and t.series == "Genesis" and t.book == "Genesis"
     assert t.gathering == "Testimonies, Women’s Retreat"
+    assert t.gathering_slugs == ("testimonies", "womens-retreat")
     assert (t.date_preached, t.duration, t.scripture, t.translation) == (
         "2026-10-23",
         "0:27:58",
