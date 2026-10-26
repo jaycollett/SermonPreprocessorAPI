@@ -9,7 +9,9 @@ logging.basicConfig(
 )
 
 # Configuration variables
-API_KEY = os.getenv("API_KEY", "499817f8-623f-4fae-b828-8dc551aba9bb")  # Replace with your API key or set as environment variable
+API_KEY = os.getenv("API_KEY")  # required; no default so no key lives in the repo
+if not API_KEY:
+    raise SystemExit("Set API_KEY in the environment before running testIt.py.")
 API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:5060")
 SERMON_DATE = "2025-02-01"  # Date filter in YYYY-MM-DD format
 

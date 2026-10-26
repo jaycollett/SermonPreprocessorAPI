@@ -37,8 +37,9 @@ COPY --from=builder /opt/venv /opt/venv
 COPY app.py .
 COPY background_scraper.py .
 
-# Set environment variables (including the API key for basic authentication) API KEY IS NOT REAL
-ENV API_KEY=499817f8-623f-4fae-b828-8dc551aba9bb
+# Non-secret defaults only. API_KEY is supplied at run time (runIt.sh reads
+# it from a gitignored .env); the image carries no secret and the app refuses
+# to start without it.
 ENV DB_PATH=/data/SermonProcessor.db
 ENV AUDIO_DIR=/data/audiofiles
 

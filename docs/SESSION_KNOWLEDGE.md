@@ -65,6 +65,10 @@ An independent review turned up these, now fixed:
 
 - **The API key is no longer logged.** `require_api_key` used to log the parsed Authorization header at DEBUG, which put the Basic credentials, and so the API key, in the container log on every request. It now logs only whether a key was sent and whether it matched. Logs written before the fix, including the production `docker logs` on devmachine, still contain the key. The key is the same value that is committed in the Dockerfile.
 
+### API key is a runtime secret (2026-10-26)
+
+Until this change the Dockerfile set `ENV API_KEY=...`, and the production container on devmachine got its key from that image ENV: `docker run` passed no `-e`, and the container and image values hashed the same. The same value is SermonOrchestrator's `SERMON_FETCHING_API_KEY`. The image no longer contains the key. `runIt.sh` sources a gitignored `.env` (the same pattern as SermonOrchestrator's `runDocker.sh`), checks that `API_KEY` is set and not blank before it stops the old container, and passes it with a bare `-e API_KEY` so the value never appears on a command line. `app.py` exits at import with a clear message when `API_KEY` is missing or blank. The old value is still in git history and in pre-fix container logs, so rotating it (here and in SermonOrchestrator's `.env`) is the only way to retire it.
+
 ### Where production runs
 
 Production is not on K3S. It runs as a plain Docker container named `sermonpreprocessor` (image `sermonpreprocessor:latest`, built locally from `runIt.sh`) on devmachine (192.168.0.228), next to the `sermonorchestrator` container, which reaches it at `host.docker.internal:5060`. The data directory is bind-mounted from `/home/jay/SourceCode/SermonPreprocessorAPI/data` to `/data`. The GitHub workflow publishes to ghcr.io, but the running container uses the locally built image.

@@ -24,11 +24,24 @@ This application:
 - **GET /sermons?date=YYYY-MM-DD**: Retrieves sermons fetched on or after the specified date. Each item has the original keys (`id`, `title`, `audio_url`, `categories`, `fetched_date`, `download_url`) plus `wp_post_id`, `speaker`, `series`, `gathering`, `book`, `scripture`, `translation`, `date_preached`, `duration`, `summary`, and `link`, which are null until a row has been matched to the archive
 - **GET /download/<sermon_id>**: Downloads the audio file for a specific sermon
 
+## Required secrets
+
+`API_KEY` has no default and no fallback. It is the HTTP basic-auth password that clients send to `GET /sermons` and `GET /download/<id>` (SermonOrchestrator sends it as `SERMON_FETCHING_API_KEY`). The app exits at startup with a clear message if it is unset or blank, and the Docker image does not contain it.
+
+`runIt.sh` reads it from a gitignored `.env` beside the script:
+
+```bash
+cp .env.example .env && chmod 600 .env && $EDITOR .env
+./runIt.sh
+```
+
+`runIt.sh` checks the key before it stops or removes the running container, so a missing `.env` leaves the current container running. It passes the key to `docker run` through the environment (`-e API_KEY`), which keeps the value off the command line. An `API_KEY` already exported in your shell takes precedence over the file. To keep the file elsewhere, set `PREPROCESSOR_ENV_FILE`.
+
 ## Environment Variables
 
 - `DB_PATH`: Path to the SQLite database (default: `/data/SermonProcessor.db`)
 - `AUDIO_DIR`: Directory to store downloaded audio files (default: `/data/audiofiles`)
-- `API_KEY`: Required API key for authentication
+- `API_KEY`: Required. See [Required secrets](#required-secrets).
 - `FLASK_DEBUG`: Set to `1` to run Flask in debug mode for local development only (default: off). Never enable it in production: the debugger can run code from the browser.
 - `API_PAGE_DELAY_SECONDS`: Pause between API pages (default: `1.0`)
 - `SCRAPER_DRY_RUN`: Set to `1` to make `python background_scraper.py` report only

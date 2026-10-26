@@ -21,9 +21,13 @@ app = Flask(__name__)
 # Configuration from environment variables
 DB_PATH = os.getenv("DB_PATH", "/data/SermonProcessor.db")
 AUDIO_DIR = os.getenv("AUDIO_DIR", "/data/audiofiles")
-API_KEY = os.getenv("API_KEY")
+API_KEY = os.getenv("API_KEY", "").strip()
 if not API_KEY:
-    raise Exception("API_KEY environment variable not set.")
+    # No default on purpose: the image carries no secret. See README "Required secrets".
+    raise SystemExit(
+        "API_KEY is not set (or is blank). Set it in .env beside runIt.sh "
+        "(see .env.example) or pass it with -e API_KEY=... to docker run."
+    )
 
 # Extra keys returned by GET /sermons (added on top of the original response shape).
 SERMON_METADATA_FIELDS = (

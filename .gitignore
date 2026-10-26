@@ -8,3 +8,6 @@
 # Python caches
 __pycache__/
 .pytest_cache/
+
+# Secrets (see .env.example and README "Required secrets")
+.env
